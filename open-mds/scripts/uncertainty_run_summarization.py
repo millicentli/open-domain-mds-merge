@@ -18,7 +18,7 @@ Fine-tuning the library models for sequence to sequence.
 
 To run:
 python ./scripts/uncertainty_run_summarization.py "./conf/base.yml" "./conf/ms2/led-base/eval.yml" \
-    output_dir="./output/ms2_small/led-base/ms2_25" \
+    output_dir="./output/ms2_split=2/led-base/" \
     dataset_name="./output/datasets/ms2_25/"
 """
 # You can also adapt this script on your own sequence to sequence task. Pointers for this are left as comments.
@@ -26,8 +26,9 @@ python ./scripts/uncertainty_run_summarization.py "./conf/base.yml" "./conf/ms2/
 import logging
 import json
 import os
-import torch
 import sys
+import time
+import torch
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -320,35 +321,6 @@ summarization_name_mapping = {
     "wiki_summary": ("article", "highlights"),
     "multi_news": ("document", "summary"),
 }
-
-class SubsetDataset(Dataset):
-    """
-    Custom dataset which lets us retrieve the samples according to the number
-    of subsets possible.
-
-    Makes it easier to get the samples that we want, as opposed to making multiple
-    dataloaders.
-    """
-
-    def __init__(self, dataset):
-        self.dataset = dataset
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def num_subsets(self):
-        return len(self.dataset[0])
-
-    def __getitem__(self, idx):
-        breakpoint()
-        items = self.dataset[idx]
-        outputs = {idx: item for item in enumerate(items)}
-        return {
-            'input_ids': items['input_ids'],
-            'attention_mask': items['attention_mask'],
-            'labels': items['labels'],
-            'global_attention_mask': items['global_attention_mask']
-        }
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -668,7 +640,6 @@ def main():
         # For each batch, need to go through and just concat the sets before inputting
         # Go through the inputs and remove from list
         inputs = [i for item in inputs for i in item]
-
         model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
         mod_model_inputs = model_inputs['input_ids']
         mod_attention_mask = model_inputs['attention_mask']
@@ -738,7 +709,6 @@ def main():
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
-
         with training_args.main_process_first(desc="validation dataset map pre-processing"):
             eval_dataset = eval_dataset.map(
                 partial(preprocess_function, subsets=subsets),
@@ -906,7 +876,6 @@ def main():
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
-        dataset = SubsetDataset(eval_dataset)
         collate_fn = SubsetDataCollator(tokenizer)
 
         # We're doing it manually, going through the files
@@ -927,20 +896,50 @@ def main():
         model.eval()
         model.to(device)
         # sep_id = tokenizer(doc_sep_token)['input_ids'][1]
-        final_outputs = []
-        for steps, inputs in tqdm(enumerate(dataloader), total=len(dataloader)):
-            with torch.no_grad():
-                inputs_list = [i['input_ids'].to(device) for i in inputs]
-                atten_list = [i['attention_mask'].to(device) for i in inputs]
-                generated_sequence = torch.tensor([[tokenizer.sep_token_id]]).to(device)  # initial token
 
+        final_outputs = []
+        for step, inputs in tqdm(enumerate(dataloader), total=len(dataloader)):
+            start_time = time.time()
+
+            inputs_list = [i['input_ids'].to(device) for i in inputs]
+            atten_list = [i['attention_mask'].to(device) for i in inputs]
+            generated_sequence = torch.tensor([[tokenizer.sep_token_id]]).to(device)  # initial token
+
+            # We cache the initial information so we don't have to repeat the calculations every time.
+            # Do this first initially
+            all_past_key_values = len(inputs_list) * [None]
+            all_encoder_outputs = []
+            probs_list = []
+            for idx, (new_input, new_atten) in enumerate(zip(inputs_list, atten_list)):
+                with torch.no_grad():
+                    outputs = model(
+                        input_ids=new_input.reshape(1, -1),
+                        attention_mask=new_atten.reshape(1, -1),
+                        decoder_input_ids=generated_sequence,
+                        past_key_values=all_past_key_values[idx]
+                    )
+                    next_token_logits = outputs.logits[:, -1, :]
+                    next_token_scores = next_token_logits.softmax(dim=-1)
+                    probs_list.append(next_token_scores)
+                    
+                all_encoder_outputs.append(outputs.encoder_last_hidden_state)
+                all_past_key_values[idx] = outputs.past_key_values
+            
+            # Average the probs list, then take token with highest probability
+            average_probs = torch.mean(torch.stack(probs_list).squeeze(), dim=0)
+            next_token = average_probs.argmax()
+
+            # Append token to generated sequence
+            generated_sequence = torch.cat((generated_sequence, next_token.unsqueeze(0).unsqueeze(0)), dim=1)
+
+            with torch.no_grad():
                 while True:
-                    probs_list = []
+                    probs_list = []                    
                     for new_input, new_atten in zip(inputs_list, atten_list):
                         outputs = model(
-                            input_ids=new_input.reshape(1, -1),
-                            attention_mask=new_atten.reshape(1, -1),
-                            decoder_input_ids=generated_sequence
+                            decoder_input_ids=generated_sequence,
+                            past_key_values=all_past_key_values[idx],
+                            encoder_outputs=all_encoder_outputs[idx]
                         )
                         next_token_logits = outputs.logits[:, -1, :]
                         next_token_scores = next_token_logits.softmax(dim=-1)
@@ -965,6 +964,49 @@ def main():
         all_generated = [i['generated'] for i in final_outputs]
         all_target = [i['target'] for i in final_outputs]
         final_results = compute_metrics(all_inputs, all_generated, all_target)
+
+        # final_outputs = []
+        # for steps, inputs in tqdm(enumerate(dataloader), total=len(dataloader)):
+        #     breakpoint()
+        #     start_time = time.time()
+        #     with torch.no_grad():
+        #         inputs_list = [i['input_ids'].to(device) for i in inputs]
+        #         atten_list = [i['attention_mask'].to(device) for i in inputs]
+        #         generated_sequence = torch.tensor([[tokenizer.sep_token_id]]).to(device)  # initial token
+
+        #         while True:
+        #             probs_list = []
+        #             for new_input, new_atten in zip(inputs_list, atten_list):
+        #                 outputs = model(
+        #                     input_ids=new_input.reshape(1, -1),
+        #                     attention_mask=new_atten.reshape(1, -1),
+        #                     decoder_input_ids=generated_sequence
+        #                 )
+        #                 next_token_logits = outputs.logits[:, -1, :]
+        #                 next_token_scores = next_token_logits.softmax(dim=-1)
+        #                 probs_list.append(next_token_scores)
+
+        #             # Average the probs list, then take token with highest probability
+        #             average_probs = torch.mean(torch.stack(probs_list).squeeze(), dim=0)
+        #             next_token = average_probs.argmax()
+
+        #             # Append token to generated sequence
+        #             generated_sequence = torch.cat((generated_sequence, next_token.unsqueeze(0).unsqueeze(0)), dim=1)
+        #             if generated_sequence.squeeze()[-1] == tokenizer.eos_token_id:
+        #                 break
+        #     print(tokenizer.batch_decode(generated_sequence, skip_special_tokens=True))
+        #     print("--- %s seconds ---" % (time.time() - start_time))
+
+        #     inputs_list = [i.cpu() for i in inputs_list]
+        #     final_outputs.append({
+        #         'inputs': inputs_list,
+        #         'generated': generated_sequence[0].cpu(),
+        #         'target': inputs[0]['label_ids'].cpu()
+        #     })
+        # all_inputs = [i['inputs'] for i in final_outputs]
+        # all_generated = [i['generated'] for i in final_outputs]
+        # all_target = [i['target'] for i in final_outputs]
+        # final_results = compute_metrics(all_inputs, all_generated, all_target)
 
         if not os.path.isdir(training_args.output_dir):
             os.makedirs(training_args.output_dir)
