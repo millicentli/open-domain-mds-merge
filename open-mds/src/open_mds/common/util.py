@@ -172,6 +172,24 @@ def batch_decode_multi_doc(sequences, tokenizer: PreTrainedTokenizerBase, doc_se
     decoded_sequences = [re.sub(pattern, "", inputs).strip() for inputs in decoded_sequences]
     return decoded_sequences
 
+def batch_decode_subset_multi_doc(sequences, tokenizer: PreTrainedTokenizerBase, doc_sep_token: str, **kwargs):
+    """
+    Similar to the above, but does it for each subset.
+    """
+    skip_special_tokens = kwargs.pop("skip_special_tokens", None)
+    if skip_special_tokens:
+        warnings.warn("`skip_special_tokens=True` was provided to batch_decode_multi_doc but will be ignored.")
+
+
+    decoded_sequences = [tokenizer.batch_decode(seq, skip_special_tokens=False, **kwargs) for seq in sequences]
+    pattern = rf"{tokenizer.pad_token}"
+    if tokenizer.bos_token is not None and tokenizer.bos_token != doc_sep_token:
+        pattern += rf"|{tokenizer.bos_token}"
+    if tokenizer.eos_token is not None and tokenizer.eos_token != doc_sep_token:
+        pattern += rf"|{tokenizer.eos_token}"
+
+    decoded_sequences = [[re.sub(pattern, "", i).strip() for i in inputs] for inputs in decoded_sequences]
+    return decoded_sequences
 
 def preprocess_multi_news(text: str, summary: str, doc_sep_token: str) -> Tuple[str, str]:
     text = text.strip(DOC_SEP_TOKENS["multi_news"]).strip()

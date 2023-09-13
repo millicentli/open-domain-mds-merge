@@ -24,13 +24,18 @@ python ./scripts/uncertainty_run_summarization.py "./conf/base.yml" "./conf/ms2/
 # You can also adapt this script on your own sequence to sequence task. Pointers for this are left as comments.
 
 import logging
+import json
 import os
 import torch
 import sys
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional
+from torch.utils.data import Dataset
 from tqdm import tqdm
+from typing import Dict, List, Optional, Any, Union
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.utils import PaddingStrategy
 
 import datasets
 import flatten_dict
@@ -316,6 +321,34 @@ summarization_name_mapping = {
     "multi_news": ("document", "summary"),
 }
 
+class SubsetDataset(Dataset):
+    """
+    Custom dataset which lets us retrieve the samples according to the number
+    of subsets possible.
+
+    Makes it easier to get the samples that we want, as opposed to making multiple
+    dataloaders.
+    """
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def num_subsets(self):
+        return len(self.dataset[0])
+
+    def __getitem__(self, idx):
+        breakpoint()
+        items = self.dataset[idx]
+        outputs = {idx: item for item in enumerate(items)}
+        return {
+            'input_ids': items['input_ids'],
+            'attention_mask': items['attention_mask'],
+            'labels': items['labels'],
+            'global_attention_mask': items['global_attention_mask']
+        }
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -577,7 +610,7 @@ def main():
                         text=examples[text_column][i],
                         summary=examples[summary_column][i],
                         ref_abstract=examples["ref_abstract"][i],
-                        doc_sep_token=doc_sep_token,
+                        doc_sep_token=doc_sep_tok1010en,
                     )
                 elif data_args.dataset_config_name == "ms2" or "ms2" in data_args.dataset_name:
                     text, summary = util.preprocess_ms2_marginalization(
@@ -606,14 +639,14 @@ def main():
 
         return {"inputs": inputs, "targets": targets}
 
-    def preprocess_function(examples):
+    def preprocess_function(examples, subsets=1):
+        print("in preprocess!")
         preprocessed_batch = _preprocess_batch(examples)
         inputs, targets = preprocessed_batch["inputs"], preprocessed_batch["targets"]
         # Before we perturb...
         # record the number of documents in each instance
 
         orig_num_docs = [[util.get_num_docs(text, doc_sep_token=doc_sep_token) for text in inp] for inp in inputs]
-
         # Rather than naively truncating the concatenated documents, we follow
         # https://aclanthology.org/2021.naacl-main.380/ and https://arxiv.org/abs/2110.08499
         # by truncating each document separately to statisfy the max length of the input.
@@ -632,11 +665,23 @@ def main():
             for texts, num_docs in zip(inputs, orig_num_docs)
         ]
 
+        # For each batch, need to go through and just concat the sets before inputting
+        # Go through the inputs and remove from list
+        inputs = [i for item in inputs for i in item]
+
         model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
+        mod_model_inputs = model_inputs['input_ids']
+        mod_attention_mask = model_inputs['attention_mask']
+        new_model_inputs = [mod_model_inputs[idx: idx + subsets] for idx in range(0, len(mod_model_inputs), subsets)]
+        new_attention_mask = [mod_attention_mask[idx: idx + subsets] for idx in range(0, len(mod_attention_mask), subsets)]
+
+        model_inputs['input_ids'] = new_model_inputs
+        model_inputs['attention_mask'] = new_attention_mask
 
         # Tokenize targets with the `text_target` keyword argument
         labels = tokenizer(text_target=targets, max_length=max_target_length, padding=padding, truncation=True)
 
+        # For the model inputs, combine the related inputs (depending on the split #)
         # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
         # padding in the loss.
         if padding == "max_length" and data_args.ignore_pad_token_for_loss:
@@ -662,6 +707,10 @@ def main():
     # Determine the document seperator token for this model.
     doc_sep_token = util.get_doc_sep_token(tokenizer)
     logger.info(f"Using {doc_sep_token} as the document seperator token.")
+
+    # Determine the number of dataset subsets -- change this maybe
+    subsets = len(raw_datasets['validation']['pmid'][0])
+    logger.info(f"Number of subsets: {subsets}")
 
     if training_args.do_train:
         if "train" not in raw_datasets:
@@ -689,9 +738,10 @@ def main():
         if data_args.max_eval_samples is not None:
             max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
             eval_dataset = eval_dataset.select(range(max_eval_samples))
+
         with training_args.main_process_first(desc="validation dataset map pre-processing"):
             eval_dataset = eval_dataset.map(
-                preprocess_function,
+                partial(preprocess_function, subsets=subsets),
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 remove_columns=column_names,
@@ -699,7 +749,6 @@ def main():
                 desc="Running tokenizer on validation dataset",
                 batch_size=None,
             )
-
     if training_args.do_predict:
         max_target_length = data_args.val_max_target_length
         if "test" not in raw_datasets:
@@ -721,26 +770,86 @@ def main():
 
     # Data collator
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer,
-        model=model,
-        label_pad_token_id=label_pad_token_id,
-        pad_to_multiple_of=8 if training_args.fp16 else None,
-    )
+
+    @dataclass
+    class SubsetDataCollator:
+        """
+        Somewhat based on DataCollatorForSeq2Seq (Huggingface), but custom made for subset needs
+        """
+        tokenizer: PreTrainedTokenizerBase
+        model: Optional[Any] = None
+        padding: Union[bool, str, PaddingStrategy] = True
+        max_length: Optional[int] = None
+        pad_to_multiple_of: Optional[int] = None
+        label_pad_token_id: int = -100
+        return_tensors: return_tensors = "pt"
+
+        def __call__(self, features, return_tensors=None):
+            if return_tensors is None:
+                return_tensors = self.return_tensors
+            labels = [feature["labels"] for feature in features] if "labels" in features[0].keys() else None
+
+            if labels is not None:
+                max_label_length = max(len(l) for l in labels)
+                if self.pad_to_multiple_of is not None:
+                    max_label_length = (
+                        (max_label_length + self.pad_to_multiple_of - 1)
+                        // self.pad_to_multiple_of * self.pad_to_multiple_of
+                    )
+                padding_side = self.tokenizer.padding_side
+                for feature in features:
+                    remainder = [self.label_pad_token_id] * (max_label_length - len(feature["labels"]))
+                    if isinstance(feature["labels"], list):
+                        feature["labels"] = (
+                            feature["labels"] + remainder if padding_side == "right" else remainder + feature["labels"]
+                        )
+                    elif padding_side == "right":
+                        feature["labels"] = np.concatenate([feature["labels"], remainder]).astype(np.int64)
+                    else:
+                        feature["labels"] = np.concatenate([remainder, feature["labels"]]).astype(np.int64)
+
+            # TODO: support more than one batch at a time, I currently only support 1 for simplicity
+            if len(features) > 1:
+                raise NotImplementedError("Multiple batches not supported!")
+            else:
+                # Need to pad items of the same 
+                item = features[0]
+                item_list = []
+                item_dict = {}
+                for inputs, atten, global_atten in zip(item['input_ids'], item['attention_mask'], item['global_attention_mask']):
+                    item_dict = {
+                        'input_ids': torch.LongTensor(inputs),
+                        'attention_mask': torch.LongTensor(atten),
+                        'label_ids': torch.LongTensor(item['labels']),
+                        'global_attention_ids': torch.LongTensor([global_atten])
+                    }
+                    item_list.append(item_dict)
+
+            # prepare decoder_input_ids
+            if (
+                labels is not None
+                and self.model is not None
+                and hasattr(self.model, "prepare_decoder_input_ids_from_labels")
+            ):
+                decoder_input_ids = self.model.prepare_decoder_input_ids_from_labels(labels=features[0]["labels"])
+                for item in item_list:
+                    item["decoder_input_ids"] = decoder_input_ids
+
+            return item_list
 
     # Metrics
-    def compute_metrics(eval_preds):
-        preds, labels, inputs = eval_preds.predictions, eval_preds.label_ids, eval_preds.inputs
+    def compute_metrics(inputs, generated, target):
+        preds, labels, inputs = generated, target, inputs
         if isinstance(preds, tuple):
             preds = preds[0]
         if data_args.ignore_pad_token_for_loss:
             # Replace -100 in the preds as we can't decode them.
-            preds = np.where(preds != -100, preds, tokenizer.pad_token_id)
+            preds = [np.where(pred != -100, pred, tokenizer.pad_token_id) for pred in preds]
             decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
             # Replace -100 in the labels as we can't decode them.
-            labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+            labels = [np.where(label != -100, label, tokenizer.pad_token_id) for label in labels]
             if inputs is not None:
-                inputs = np.where(inputs != -100, inputs, tokenizer.pad_token_id)
+                inputs = [[np.where(i != -100, i, tokenizer.pad_token_id) for i in inp] for inp in inputs]
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
         # Compute and post-process rouge results
@@ -764,11 +873,11 @@ def main():
         results["labels"] = decoded_labels
         results["preds"] = decoded_preds
         if inputs is not None:
-            results["inputs"] = util.batch_decode_multi_doc(inputs, tokenizer, doc_sep_token=doc_sep_token)
+            results["inputs"] = util.batch_decode_subset_multi_doc(inputs, tokenizer, doc_sep_token=doc_sep_token)
         # Add length of reference and generated summaries
         results["label_len"] = [np.count_nonzero(label != tokenizer.pad_token_id) for label in labels]
         results["pred_len"] = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
-        results["input_len"] = [np.count_nonzero(example != tokenizer.pad_token_id) for example in inputs]
+        results["input_len"] = [[np.count_nonzero(example != tokenizer.pad_token_id) for example in examples] for examples in inputs]
         return results
 
     # Log some additional, split-agnositic information in the all_results dictionary
@@ -797,128 +906,40 @@ def main():
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
+        dataset = SubsetDataset(eval_dataset)
+        collate_fn = SubsetDataCollator(tokenizer)
+
         # We're doing it manually, going through the files
         # TODO: implement a batched version of this evaluation. It's 1 because it's easier to implement
+        # TODO: implement collate_fn
         dataloader = torch.utils.data.DataLoader(
             eval_dataset,
-            # batch_size=data_args.batch_size,
             batch_size=1,
-            collate_fn=data_collator,
+            collate_fn=collate_fn,
             num_workers=0
         )
         logger.info(f"***** Running evaluation *****")
         logger.info(f"  Num examples = {len(dataloader)}")
         logger.info(f"  Batch size = 1")
 
-        def find_intersection(separators):
-            """
-            Finds the location of the intersection where the splits should be created.
-            """
-            intersections = []
-            prev_idx = -100
-            for curr_idx in separators:
-                curr_idx = curr_idx.item()
-                if curr_idx - 1 == prev_idx:
-                    intersections.append((prev_idx, curr_idx))
-                prev_idx = curr_idx
-
-            return intersections
-
-        def split_input(inputs, intersections):
-            """
-            Splits the current input into their respective parts.
-            """
-
-            inputs_list = []
-            atten_list = []
-            start_idx = 0
-            for intersection in intersections:
-                end_idx = intersection[0]
-                pad_token_id = tokenizer.pad_token_id
-
-                # Remove the padding from the input
-                # 0 assumes that inputs is 1xN
-                idx = ((inputs['input_ids'][0] == pad_token_id).nonzero(as_tuple=True)[0])
-                if len(idx) == 0:
-                    input_ids = inputs['input_ids'].squeeze()
-                    atten_mask = inputs['attention_mask'].squeeze()
-                else:
-                    idx = idx[0]
-                    input_ids = inputs['input_ids'].squeeze()[:idx]
-                    atten_mask = inputs['attention_mask'].squeeze()[:idx]
-
-                # add a bos token
-                if start_idx != 0:
-                    inputs_list.append(
-                        torch.cat(
-                            (
-                                torch.LongTensor([tokenizer.bos_token_id]),
-                                input_ids[start_idx: end_idx + 1]
-                            )
-                        )
-                    ).unsqueeze(0)
-
-                    atten_list.append(
-                        torch.cat(
-                            (
-                                torch.LongTensor([tokenizer.pad_token_id]),
-                                atten_mask[start_idx: end_idx + 1]
-                            )
-                        )
-                    ).unsqueeze(0)
-                else:
-                    inputs_list.append(
-                        input_ids.squeeze()[start_idx: end_idx + 1].unsqueeze(0)
-                    )
-
-                    atten_list.append(
-                        atten_mask.squeeze()[start_idx: end_idx + 1].unsqueeze(0)
-                    )
-
-                start_idx = end_idx + 1
-            
-                inputs_list.append(
-                    torch.cat(
-                        (
-                            torch.LongTensor([tokenizer.bos_token_id]),
-                            input_ids[end_idx + 2:]
-                        )
-                    ).unsqueeze(0)
-                )
-
-                atten_list.append(
-                    torch.cat(
-                        (
-                            torch.LongTensor([tokenizer.pad_token_id]),
-                            atten_mask[end_idx + 2:]
-                        )
-                    ).unsqueeze(0)
-                )
-            return inputs_list, atten_list
-
         # Generating one token at a time:
         # https://stackoverflow.com/questions/72486821/summarization-with-huggingface-how-to-generate-one-word-at-a-time
         model.eval()
         model.to(device)
-        sep_id = tokenizer(doc_sep_token)['input_ids'][1]
-
-        for steps, inputs in tqdm(enumerate(dataloader)):
+        # sep_id = tokenizer(doc_sep_token)['input_ids'][1]
+        final_outputs = []
+        for steps, inputs in tqdm(enumerate(dataloader), total=len(dataloader)):
             with torch.no_grad():
-                sep_locs = (inputs['input_ids'] == sep_id).nonzero(as_tuple=True)[1]
-                intersections = find_intersection(sep_locs)
-                inputs_list, atten_list = split_input(inputs, intersections)
-
+                inputs_list = [i['input_ids'].to(device) for i in inputs]
+                atten_list = [i['attention_mask'].to(device) for i in inputs]
                 generated_sequence = torch.tensor([[tokenizer.sep_token_id]]).to(device)  # initial token
-                # while generated_sequence[:, -1] != tokenizer.eos_token_id:
+
                 while True:
                     probs_list = []
                     for new_input, new_atten in zip(inputs_list, atten_list):
-                        new_input = new_input.to(device)
-                        new_atten = new_atten.to(device)
-                        # labels = labels.to(device)
                         outputs = model(
-                            input_ids=new_input,
-                            attention_mask=new_atten,
+                            input_ids=new_input.reshape(1, -1),
+                            attention_mask=new_atten.reshape(1, -1),
                             decoder_input_ids=generated_sequence
                         )
                         next_token_logits = outputs.logits[:, -1, :]
@@ -928,35 +949,32 @@ def main():
                     # Average the probs list, then take token with highest probability
                     average_probs = torch.mean(torch.stack(probs_list).squeeze(), dim=0)
                     next_token = average_probs.argmax()
-                    print(tokenizer.decode(next_token.item()))
+
                     # Append token to generated sequence
                     generated_sequence = torch.cat((generated_sequence, next_token.unsqueeze(0).unsqueeze(0)), dim=1)
                     if generated_sequence.squeeze()[-1] == tokenizer.eos_token_id:
                         break
-                
-            print(tokenizer.decode(*generated_sequence.tolist()))
-            print("hello")
+
+            inputs_list = [i.cpu() for i in inputs_list]
+            final_outputs.append({
+                'inputs': inputs_list,
+                'generated': generated_sequence[0].cpu(),
+                'target': inputs[0]['label_ids'].cpu()
+            })
+        all_inputs = [i['inputs'] for i in final_outputs]
+        all_generated = [i['generated'] for i in final_outputs]
+        all_target = [i['target'] for i in final_outputs]
+        final_results = compute_metrics(all_inputs, all_generated, all_target)
+
+        if not os.path.isdir(training_args.output_dir):
+            os.makedirs(training_args.output_dir)
+        output_prediction_file = os.path.join(training_args.output_dir, "outputs.json")
+        with open(output_prediction_file, "w") as writer:
+            json.dump(final_results, writer)
 
     if training_args.do_predict:
         logger.info("*** Predict ***")
         raise NotImplementedError
-
-    kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "summarization"}
-    if data_args.dataset_name is not None:
-        kwargs["dataset_tags"] = data_args.dataset_name
-        if data_args.dataset_config_name is not None:
-            kwargs["dataset_args"] = data_args.dataset_config_name
-            kwargs["dataset"] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
-        else:
-            kwargs["dataset"] = data_args.dataset_name
-
-    if data_args.lang is not None:
-        kwargs["language"] = data_args.lang
-
-    if training_args.push_to_hub:
-        trainer.push_to_hub(**kwargs)
-    else:
-        trainer.create_model_card(**kwargs)
 
     return results
 
