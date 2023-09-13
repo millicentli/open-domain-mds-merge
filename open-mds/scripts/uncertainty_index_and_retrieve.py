@@ -204,7 +204,7 @@ def main(
         False, "--overwrite-cache", help="Overwrite the cached copy of the HuggingFace dataset, if it exits."
     ),
     subsets: int = typer.Argument(
-        2, # should be ~10 but I'll do 2 for now
+        1, # should be ~10 but I'll do 2 for now
         help="Number of subsets per query that we keep"
     ),
     num_docs: int = typer.Argument(
@@ -229,6 +229,10 @@ def main(
 
 ) -> None:
     """Recreates the chosen HuggingFace dataset using the documents retrieved from an IR system."""
+    
+    print(
+        f"[bold]:magnifying_glass_tilted_right: Subset set at '{subsets}'... [/bold]"
+    )
 
     # Model-specific setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
