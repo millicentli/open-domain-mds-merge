@@ -68,7 +68,7 @@ from transformers.utils.versions import require_version
 
 from open_mds import metrics as summarization_metrics
 from open_mds.common import util
-from open_mds.common import evaluate
+from open_mds.common import evaluate, generate
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.21.0.dev0")
@@ -477,6 +477,7 @@ def main():
     model.resize_token_embeddings(len(tokenizer))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = "cpu"
 
     if model.config.decoder_start_token_id is None and isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast)):
         if isinstance(tokenizer, MBartTokenizer):
@@ -891,6 +892,7 @@ def main():
     
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
+        # breakpoint()
 
         collate_fn = SubsetDataCollator(tokenizer)
 
@@ -930,24 +932,46 @@ def main():
         model.to(device)
         final_outputs = []
         for step, inputs in tqdm(enumerate(dataloader), total=len(dataloader)):
-            
-            sequence_outputs = evaluate.modified_beam_search(
+            # breakpoint()
+            # print("Here's inputs:", inputs[0]['input_ids'])
+            # print(tokenizer.batch_decode(inputs[0]['input_ids']))
+            # sequence_outputs = evaluate.modified_beam_search(
+            #     inputs,
+            #     model,
+            #     tokenizer,
+            #     # beam_scorer,
+            #     logits_processor,
+            #     num_beams=num_beams,
+            #     device=device
+            # )
+            # TODO: Put inputs on device before sending it into generate
+            # print(inputs[0]['input_ids'].device)
+            inputs = [
+                {
+                    'input_ids': i['input_ids'].cuda(),
+                    'attention_mask': i['attention_mask'].cuda(),
+                    'label_ids': i['label_ids'].cuda(),
+                    'global_attention_ids': i['global_attention_ids'].cuda()
+                } for i in inputs
+            ]
+            sequence_outputs = generate.modified_generate(
                 inputs,
-                model,
-                tokenizer,
-                # beam_scorer,
-                logits_processor,
+                model=model,
+                tokenizer=tokenizer,
+                # logits_processor,
                 num_beams=num_beams,
-                device=device
+                no_repeat_ngram_size=3,
+                max_length=100,
             )
 
+            # breakpoint()
             # print("Here's sequence_outputs:", sequence_outputs)
             # print(tokenizer.batch_decode(sequence_outputs['sequences']))
             # inputs_list = [i.cpu() for i in inputs_list]
-            inputs_list = [i['input_ids'] for i in inputs]
+            inputs_list = [i['input_ids'].cpu() for i in inputs]
             final_outputs.append({
                 'inputs': inputs_list,
-                'generated': sequence_outputs['sequences'].cpu(),
+                'generated': sequence_outputs.cpu(),
                 'target': inputs[0]['label_ids'].cpu()
             })
 

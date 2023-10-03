@@ -18,7 +18,7 @@ Fine-tuning the library models for sequence to sequence.
 
 To run:
 python ./scripts/run_summarization.py "./conf/base.yml" "./conf/ms2/led-base/eval.yml" \
-    output_dir="./output/ms2_small/led-base/retrieval/dense/mean" \
+    output_dir="./output/ms2/led-base/retrieval/dense/mean" \
     dataset_name="./output/datasets/ms2_dense_mean/" \
     retriever="dense" \
     top_k_strategy="mean"
