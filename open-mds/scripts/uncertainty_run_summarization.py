@@ -19,7 +19,9 @@ Fine-tuning the library models for sequence to sequence.
 To run:
 python ./scripts/uncertainty_run_summarization.py "./conf/base.yml" "./conf/ms2/led-base/eval.yml" \
     output_dir="./output/ms2_split=2/led-base/" \
-    dataset_name="./output/datasets/ms2_split=2/"
+    dataset_name="./output/datasets/ms2_split=2/" \
+    2 \
+    10 \
 """
 # You can also adapt this script on your own sequence to sequence task. Pointers for this are left as comments.
 
@@ -68,7 +70,7 @@ from transformers.utils.versions import require_version
 
 from open_mds import metrics as summarization_metrics
 from open_mds.common import util
-from open_mds.common import evaluate, generate
+from open_mds.common import generate
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.21.0.dev0")

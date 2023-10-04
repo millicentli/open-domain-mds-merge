@@ -56,14 +56,16 @@ class HuggingFacePyTerrierDataset(pt.datasets.Dataset):
     def __init__(self, path: str, name: Optional[str] = None, **kwargs) -> None:
         self.path = path
         self.name = name
-        datasets = load_dataset(self.path, self.name, split=['train[:01%]', 'validation[:01]', 'test[:01%]'], **kwargs)
+        self._hf_dataset = load_dataset(self.path, self.name, **kwargs)
+
+        # datasets = load_dataset(self.path, self.name, split=['train[:01%]', 'validation[:01]', 'test[:01%]'], **kwargs)
 
         # datasets = load_dataset(self.path, self.name, split=['train[:10%]', 'validation[:10%]', 'test[:10%]'], **kwargs)
-        from datasets import DatasetDict
-        self._hf_dataset = DatasetDict()
-        self._hf_dataset['train'] = datasets[0]
-        self._hf_dataset['validation'] = datasets[1]
-        self._hf_dataset['test'] = datasets[2]
+        # from datasets import DatasetDict
+        # self._hf_dataset = DatasetDict()
+        # self._hf_dataset['train'] = datasets[0]
+        # self._hf_dataset['validation'] = datasets[1]
+        # self._hf_dataset['test'] = datasets[2]
 
     def replace(
         self, example: Dict[str, Any], idx: int, *, split: str, retrieved: pd.DataFrame, k: Optional[int] = None

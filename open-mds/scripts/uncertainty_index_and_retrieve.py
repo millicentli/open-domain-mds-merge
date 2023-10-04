@@ -207,6 +207,10 @@ def main(
         1, # should be ~10 but I'll do 2 for now
         help="Number of subsets per query that we keep"
     ),
+    relevance_cutoff: int = typer.Argument(
+        100,
+        help="Percent cutoff for document relevance (if 100, 100%\ of documents are relevant)"
+    ),
     num_docs: int = typer.Argument(
         10,
         help="Number of docs we want per subsets"
@@ -232,6 +236,9 @@ def main(
     
     print(
         f"[bold]:magnifying_glass_tilted_right: Subset set at '{subsets}'... [/bold]"
+    )
+    print(
+        f"[bold]:magnifying_glass_tilted_right: Relevance cutoff set at '{relevance_cutoff}'... [/bold]"
     )
 
     # Model-specific setup
@@ -323,7 +330,13 @@ def main(
         for qid in qid_list:
             selected_docnos = []
             for subset in range(subsets):
-                related = retrieved[retrieved.qid == qid].sample(frac=1, random_state=42)
+                related = retrieved[retrieved.qid == qid]
+                # We want to take a percentage here and sample from most relevant; let's make
+                # a cutoff
+                # Calculate the percentage
+                num_docs = int((relevance_cutoff / 100) * len(related))
+                related = related.head(num_docs)
+                related = related.sample(frac=1, random_state=42)
                 related['selected'] = related.apply(sample_bern, axis=1)
                 selected = related[related.selected == 1]
                 selected_docnos.append(list(selected.docno))
