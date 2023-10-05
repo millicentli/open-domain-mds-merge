@@ -161,3 +161,6 @@ output/
 tmp/
 # Weights & Biases offline output directory
 wandb/
+
+# My additional files
+csv/
