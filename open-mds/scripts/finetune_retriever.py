@@ -21,8 +21,11 @@ To use: make sure to do: export PYTHONPATH="${PYTHONPATH}:/home/li.mil/open-doma
 
 
 To run the command:
-python ./scripts/finetune_retriever.py "./conf_retriever/base.yml" "./conf_retriever/ms2/led-base/finetune.yml" \
+python ./scripts/finetune_retriever_with_dp.py "./conf_retriever/base.yml" "./conf_retriever/ms2/led-base/finetune.yml" \
     output_dir="./output/models/contriever" \
+
+python ./scripts/finetune_retriever_with_dp.py "./conf_retriever/base.yml" "./conf_retriever/ms2/led-base/finetune.yml" \
+    output_dir="/scratch/li.mil/open-domain-mds-merge/contriever" \
 
 To put in scratch dir: /scratch/li.mil/open-domain-mds-merge/contriever
 
@@ -47,7 +50,8 @@ from dataclasses import field, dataclass
 from open_mds import indexing_basic
 from open_mds.common import util, normalize_text
 from rich import print
-from sklearn.metrics import roc_auc_score
+# from sklearn.metrics import roc_auc_score
+from sklearn import metrics
 from torch.utils.data import RandomSampler, SequentialSampler, DataLoader
 from tqdm import tqdm
 
@@ -65,10 +69,7 @@ from uncertainty_index_and_retrieve import Dataset
 Distributed training
 """
 
-import torch.multiprocessing as mp
-
-from src.open_mds.distributed_utils import setup, cleanup, prepare
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parallel import DataParallel
 
 # Logging stuff
 logger = logging.getLogger(__name__)
@@ -99,6 +100,10 @@ class RetrieverFinetuningArguments:
     seed: int = field(
         default=42,
         metadata={"help": "Seed to set for reproducibility."}
+    ),
+    n_random_negatives: int = field(
+        default=2,
+        metadata={"help": "Number of random negatives to sample"}
     )
 
 class TrainCollator(object):
@@ -118,14 +123,9 @@ class TrainCollator(object):
         self.passage_maxlength = passage_maxlength
 
     def __call__(self, batch):
-        queries = [b['question'] for b in batch]
-        # breakpoint()
-        positives = [b['positive_ctxs']['text'] for b in batch]
-        negatives = [b['negative_ctxs']['text'] for b in batch]
-
-        # Old, batched with multiple inputs
-        # positives = [b['text'] for item in batch for b in item['positive_ctxs']]
-        # negatives = [b['text'] for item in batch for b in item['negative_ctxs']]
+        queries = [b['query'] for b in batch]
+        positives = [b['gold'] for b in batch]
+        negatives = [item for ex in batch for item in ex["negatives"]]
 
         qout = self.tokenizer.batch_encode_plus(
                 queries,
@@ -182,40 +182,12 @@ class EvalCollator(object):
         self.passage_maxlength = passage_maxlength
 
     def __call__(self, batch):
-        queries = [b['question'] for b in batch]
-
+        queries = [b['query'] for b in batch]
         if len(batch) == 1:
-            positives = [item['text'] for b in batch for item in b['positive_ctxs']]
-            negatives = [item['text'] for b in batch for item in b['negative_ctxs']]
+            positives = [item for item in batch[0]["gold"]]
+            negatives = [item for item in batch[0]["negatives"]]
         else:
             raise NotImplementedError # Not sure if > 1 can be implemented
-
-        # breakpoint()
-        # positives = []
-        # negatives = []
-        # for b in batch:
-        #     pos_items = [item['text'] for item in b['positive_ctxs']]
-        #     neg_items = [item['text'] for item in b['negative_ctxs']]
-
-        #     positives.append(pos_items)
-        #     negatives.append(neg_items)
-
-        # positives = [[item['text'] for item in b['positive_ctxs']] for b in batch]
-        # negatives = [[item['text'] for item in b['negative_ctxs']] for b in batch]
-
-        # Old, batched with multiple inputs
-        # positives = [b['text'] for item in batch for b in item['positive_ctxs']]
-        # negatives = [b['text'] for item in batch for b in item['negative_ctxs']]
-
-        # Find the number of possible outputs for positives, negatives
-        # max_pos = max([len(positive) for positive in positives])
-        # max_neg = max([len(negative) for negative in negatives])
-        # max_inner_pos = max([len(p) for pos in positives for p in pos])
-        # max_inner_neg = max([len(n) for neg in negatives for n in neg])
-
-        # Next, concatenate the positives, negatives and then tokenize/encode
-        # Want to go from batch size x no. subsamples x seq length to
-        # batch size x no subsamples * seq length
 
         qout = self.tokenizer.batch_encode_plus(
             queries,
@@ -226,9 +198,6 @@ class EvalCollator(object):
             return_tensors="pt",
         )
 
-        # pos_list = []
-        # neg_list = []
-        # for pos, neg in zip(positives, negatives):
         pout = self.tokenizer.batch_encode_plus(
             positives,
             max_length=self.passage_maxlength,
@@ -245,8 +214,6 @@ class EvalCollator(object):
             add_special_tokens=True,
             return_tensors="pt",
         )
-        # pos_list.append(pout)
-            # neg_list.append(nout)
 
         return {
             "q_tokens": qout["input_ids"],
@@ -288,18 +255,14 @@ def contrastive_loss(
     q_out = model(q_tokens, q_mask)
     p_out = model(p_tokens, p_mask)
     n_out = model(n_tokens, n_mask)
-    # breakpoint()
+
     q_embed = mean_pooling(q_out[0], q_mask)
     pn_embed = torch.cat((mean_pooling(p_out[0], p_mask), mean_pooling(n_out[0], n_mask)))
+
     scores = torch.einsum("id, jd->ij", q_embed / temperature, pn_embed)
     labels = torch.arange(len(q_embed), dtype=torch.long, device=q_embed.device)
-
     loss = torch.nn.functional.cross_entropy(scores, labels, label_smoothing=label_smoothing)
-    
-    argmax = torch.argmax(scores, dim=1)
 
-    # print(f"Debugging: ", argmax)
-    # breakpoint()
     return loss
 
 def calculate_auc(scores):
@@ -308,24 +271,39 @@ def calculate_auc(scores):
 
     First, take our input scores, see if it's in the correct side (1 if correct, 0 otherwise)
     """
+    labels = torch.zeros_like(scores)
+    size = int(scores.size()[-1] / 2)
+    labels[:, :size] = 1
+
     values, indices = torch.topk(scores, scores.shape[-1], dim=1)
-
-    half = int(scores.shape[-1] / 2)
-    # pos_correctness = [1 if indices[0][idx] < half else 0 for idx in range(half)]
-    # neg_correctness = [1 if indices[0][idx + half] >= half else 0 for idx in range(half)]
-    # all_correctness = pos_correctness + neg_correctness
-
-    target_correctness = [1] * half + [0] * half
-
     outputs = torch.nn.functional.sigmoid(scores)
 
-    # assert len(all_correctness) == len(target_correctness)
-    breakpoint()
-    roc_scores = roc_auc_score(target_correctness, outputs.squeeze().cpu().numpy().tolist())
+    # Uncomment to get roc scores
+    # roc_scores = roc_auc_score(labels, outputs.squeeze().cpu().numpy().tolist())
 
-    breakpoint()
-    print("hi")
+    fpr, tpr, thresholds = metrics.roc_curve(labels.squeeze().cpu().tolist(), outputs.squeeze().cpu().numpy().tolist())
+    return metrics.auc(fpr, tpr)
 
+def calculate_mrr(scores):
+    """
+    Calculate MRR given we know our gold answers.
+    The correct scores are the first scores.size()[-1] / 2 -- take those, get the MRR.
+
+    The higher the MRR, the better.
+    A score of 0 means that nothing was correct.
+    """
+    labels = torch.zeros_like(scores)
+    size = int(scores.size()[-1] / 2)
+    labels[:, :size] = 1
+
+    sorted_scores, indices = torch.sort(scores, descending=True)
+
+    correct_mask = (indices < size).squeeze()
+    correct_indices = torch.arange(indices.size()[-1], device=indices.device)[correct_mask]
+
+    rr = sum(map(lambda x: 1 / (x.item() + 1), correct_indices))
+
+    return rr / size
 
 @torch.no_grad()
 def calculate_metrics(
@@ -347,54 +325,47 @@ def calculate_metrics(
 
     q_tokens, q_mask, p_tokens, p_mask, n_tokens, n_mask = batch.values()
 
+    p_size = len(p_tokens)
+    assert p_size == len(n_tokens)
+
     q_out = model(q_tokens, q_mask)
     p_out = model(p_tokens, p_mask)
     n_out = model(n_tokens, n_mask)
-    # breakpoint()
+
     q_embed = mean_pooling(q_out[0], q_mask)
     pn_embed = torch.cat((mean_pooling(p_out[0], p_mask), mean_pooling(n_out[0], n_mask)))
     scores = torch.einsum("id, jd->ij", q_embed, pn_embed)
-    # breakpoint()
-    # if debug:
-    labels = torch.arange(len(q_embed), dtype=torch.long, device=q_embed.device)
-    loss = torch.nn.functional.cross_entropy(scores, labels, label_smoothing=0.0)
-    # print(f"Loss: {loss.item()}")
-
-    wandb.log({"Validation loss": loss.item()})
-
-    # argmax = torch.argmax(scores, dim=1)
     
     if auc:
         # Calculate AUC
-        calculate_auc(scores)
+        auc = calculate_auc(scores)
+        wandb.log({f"AUC": auc})
     if mrr:
         # Calculate MRR
-        raise NotImplementedError
-
-    # breakpoint()
-    # print(f"Debugging eval:", argmax)
-
+        mrr = calculate_mrr(scores)
+        wandb.log({f"MRR": mrr})
 
 def finetune(
     model,
     tokenizer,
-    # accelerator,
     output_dir,
     train_dataset,
     eval_dataset,
-    lr=0.05,
-    num_epochs=100,
-    train_batch_size=16,
+    n_random_negatives,
+    lr=1e-4,
+    num_epochs=20,
+    train_batch_size=32,
     # eval_batch_size=16,
     eval_batch_size=1, # TODO: figure out if it's batchable. Don't think it is because OOM
-    log_freq=1,
+    log_freq=1000,
 ):
     # Enable optimizer
-    optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
-
-    # train_dataset = train_dataset[:1000]
+    optim = torch.optim.AdamW(model.parameters(), lr=lr)
+    train_dataset = RetrievalDataset(train_dataset, training=True, n_random_negatives=n_random_negatives)
+    
     # Enable sampler
     train_sampler = RandomSampler(train_dataset)
+    
     # Enable collator, dataloader
     collator = TrainCollator(tokenizer, passage_maxlength=512)
 
@@ -402,8 +373,10 @@ def finetune(
         train_dataset,
         sampler=train_sampler,
         batch_size=train_batch_size,
-        collate_fn=collator
+        collate_fn=collator,
+        num_workers=1
     )
+
     
     # Enable scheduler
     num_training_steps = num_epochs * len(train_dataloader)
@@ -416,10 +389,6 @@ def finetune(
 
     logger.info(f" Num training steps: {num_training_steps}")
 
-    # train_dataloader, model, optim = accelerator.prepare(
-    #     train_dataloader, model, optim
-    # )
-
     # Start train loop
     model.train()
     model.cuda()
@@ -428,7 +397,6 @@ def finetune(
     for epoch in range(num_epochs):
         for batch in tqdm(train_dataloader, desc=f"Training, Epoch {epoch}"):
             batch = {key: value.cuda() if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
-            # breakpoint()
             loss = contrastive_loss(
                 model,
                 batch,
@@ -437,12 +405,11 @@ def finetune(
             )
 
             loss.backward()
-            # accelerator.backward(loss)
 
             lr_scheduler.step()
             optim.step()
             optim.zero_grad()
-            # breakpoint()
+
             step += 1
         
             if step % log_freq == 0:
@@ -453,26 +420,29 @@ def finetune(
                 log += f" | Loss: {loss.item()}"
                 logger.info(log)
 
-                wandb.log({"Training loss": loss.item()})
+                wandb.log({"Training loss": loss.item(), "Learning rate": lr_scheduler.get_lr()[0]})
 
                 evaluate(
                     model,
                     tokenizer,
-                    # accelerator,
                     eval_dataset,
+                    n_random_negatives,
                     eval_batch_size=eval_batch_size
                 )
 
-                model.save_pretrained(f"{output_dir}/model_{step}", from_pt=True) 
+                model.module.save_pretrained(f"{output_dir}/model_{step}", from_pt=True)
+                
+                # Also save the tokeniezr while you're at it
+                tokenizer.save_pretrained(f"{output_dir}/model_{step}")
 
         
 @torch.no_grad()
-def evaluate(model, tokenizer, eval_dataset, eval_batch_size):
+def evaluate(model, tokenizer, eval_dataset, n_random_negatives, eval_batch_size):
+    eval_dataset = RetrievalDataset(eval_dataset, n_random_negatives)
     eval_sampler = SequentialSampler(eval_dataset)
 
     # Enable collator, dataloader
     collator = EvalCollator(tokenizer, passage_maxlength=512)
-    # collator = TrainCollator(tokenizer, passage_maxlength=512)
     eval_dataloader = DataLoader(
         eval_dataset,
         sampler=eval_sampler,
@@ -480,26 +450,18 @@ def evaluate(model, tokenizer, eval_dataset, eval_batch_size):
         collate_fn=collator
     )
 
-    # eval_dataloader = accelerator.prepare(
-    #     eval_dataloader
-    # )
-
     model.eval()
-
-    # breakpoint()
     for batch in tqdm(eval_dataloader, desc=f"Evaluation", total=len(eval_dataloader)):
         batch = {key: value.cuda() if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
 
         calculate_metrics(
             model,
             batch,
-            auc=False,
-            mrr=False
+            auc=True,
+            mrr=True
         )
 
-
-
-def transform_data(pt_dataset, splits = ["train", "validation"]):
+def transform_data(pt_dataset, n_random_negatives, splits = ["train", "validation"]):
     """
     Takes as input the transformers dataset, extracts the query (question), and
     creates the negative and positive examples to be used.
@@ -519,7 +481,11 @@ def transform_data(pt_dataset, splits = ["train", "validation"]):
         for idx, (query, data) in enumerate(zip(topics['query'], hf_dataset[split])):
             positive_pmids = data['pmid']
             subset_pmids = [pmid for pmid in all_pmids if pmid not in positive_pmids]
-            negative_pmids = random.sample(subset_pmids, len(data['pmid']))
+            if split == "train":
+                negative_pmids = random.sample(subset_pmids, n_random_negatives)
+            else:
+                # If eval, our neg_pmids are dependent on size of train
+                negative_pmids = random.sample(subset_pmids, len(positive_pmids))
 
             positive_ctxs = [{"text": pmids_to_abstracts[pmid]} for pmid in positive_pmids]
             negative_ctxs = [{"text": pmids_to_abstracts[pmid]} for pmid in negative_pmids]
@@ -528,40 +494,11 @@ def transform_data(pt_dataset, splits = ["train", "validation"]):
             assert positive_pmids[0] not in negative_pmids
             
             example = {}
-            if split == "train":
-                # Choose a single gold context
-                # Then, sample a bunch of negatives -- we'll sample a single one here
-                # TODO: add options to increase the number of negatives
-                # pos = random.choice(positive_ctxs)
-                # neg = random.choice(negative_ctxs)
+            example['question'] = query
+            example['positive_ctxs'] = positive_ctxs
+            example['negative_ctxs'] = negative_ctxs
+            all_examples.append(example)
 
-                # example['question'] = query
-                # example['positive_ctxs'] = pos
-                # example['negative_ctxs'] = neg
-                # all_examples.append(example)
-
-                # OLD STUFF BELOW
-                # # TODO: Need to make sure to scramble the inputs when the model makes the predictions, right now they're all in the same order
-                cartesians = itertools.product(positive_ctxs, negative_ctxs)
-                cartesians_list = list(cartesians)
-
-                for i, (pos, neg) in enumerate(cartesians_list):
-                    example = {}
-                    example['question'] = query
-                    example['positive_ctxs'] = pos
-                    example['negative_ctxs'] = neg
-
-                    all_examples.append(example)
-            else:
-                # Split is everything else, so validation or test
-                # Here, for each sample, we're going to reconstruct the dataset to include all positives and negatives together
-                example['question'] = query
-                example['positive_ctxs'] = positive_ctxs
-                example['negative_ctxs'] = negative_ctxs
-                
-                all_examples.append(example)
-
-        random.shuffle(all_examples)
         split_dict[split] = all_examples
 
     return split_dict
@@ -574,11 +511,14 @@ class RetrievalDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         input_data,
+        n_random_negatives,
         normalize=False,
-        training=False
+        training=False,
     ):
         self.normalize_fn = normalize_text.normalize if normalize_text else lambda x: x
         self.data = input_data
+        self.training = training
+        self.n_random_negatives = n_random_negatives
 
     def __len__(self):
         return len(self.data)
@@ -588,10 +528,22 @@ class RetrievalDataset(torch.utils.data.Dataset):
         Nothing fancy, just gets the item for that row
         """
         example = self.data[index]
-
+        question = example["question"]
         if self.training:
-            gold = gold["title"] + " " + gold["text"] if "title" in gold and len(gold["title"]) > 0 else gold["text"]
-            negative = n["title"] + " " + n["text"] if ("title" in n and len(n["title"]) > 0) else n["text"]
+            # For training, we want to take a single sample and randomly select a gold example
+            # From here, we want to sample some negatives -- maybe we can sample multiple negatives (n?)
+            
+            # Single gold/positive
+            gold = random.choice(example["positive_ctxs"])
+            # n > 0 negatives
+            negatives = []
+            random_negatives = random.sample(example["negative_ctxs"], self.n_random_negatives)
+            negatives.extend(random_negatives)
+
+            gold = gold["text"]
+            negatives = [
+                n["text"] for n in negatives
+            ]
             
             example = {
                 "query": self.normalize_fn(question),
@@ -601,8 +553,14 @@ class RetrievalDataset(torch.utils.data.Dataset):
 
             return example
         else:
-            breakpoint()
-            raise NotImplementedError
+            # In the validation case, we want to return all possible outputs to evaluate
+            example = {
+                "query": self.normalize_fn(question),
+                "gold": [self.normalize_fn(gold["text"]) for gold in example["positive_ctxs"]],
+                "negatives": [self.normalize_fn(n["text"]) for n in example["negative_ctxs"]]
+            }
+            
+            return example
             
 def main():
     """Trains the retriever on the current dataset"""
@@ -623,11 +581,6 @@ def main():
     else:
         retriever_args = parser.parse_args_into_dataclasses()[0]
 
-    if retriever_args.hf_dataset_name == Dataset.ms2:
-        pt_dataset = indexing_basic.MSLR2022Dataset(name=retriever_args.hf_dataset_name)
-    else:
-        raise NotImplementedError
-
     # start a new wandb run to track this script
     # TODO: integrate wandb with DDP: https://docs.wandb.ai/guides/track/log/distributed-training
     wandb.init(
@@ -647,47 +600,45 @@ def main():
         # }
     )
 
-    # suppose we have 3 gpus
-    world_size = 3    
-    mp.spawn(
-        start,
-        args=(world_size),
-        nprocs=world_size
-    )
+    # Setting seed
+    set_seed(retriever_args.seed)
 
-def start(rank, world_size):
-    # Init distributed training
-    setup(rank, world_size)
+    # Loading dataset, model, tokenizer individually per process
+    if retriever_args.hf_dataset_name == Dataset.ms2:
+        pt_dataset = indexing_basic.MSLR2022Dataset(name=retriever_args.hf_dataset_name)
+    else:
+        raise NotImplementedError
 
     print(
         f"[bold]:book: Dataset chosen: '{retriever_args.hf_dataset_name}'... [/bold]"
     )
+    print(
+        "[bold]:computer: Number of GPUs: ", torch.cuda.device_count()
+    )
     
-    set_seed(retriever_args.seed)
-
     model = AutoModel.from_pretrained(retriever_args.model_name_or_path)
     tokenizer = AutoTokenizer.from_pretrained(retriever_args.model_name_or_path)
 
-    # Put model on DDP
-    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+    # Put model on DP
+    model = DataParallel(model)
 
     splits = ["train", "validation"]
-    dataset_dict = transform_data(pt_dataset, splits)
+    dataset_dict = transform_data(
+        pt_dataset,
+        n_random_negatives=retriever_args.n_random_negatives,
+        splits=splits
+    )
 
     # Initialize everything for training
-    logger.info("Start training")
+    logger.info(f" Starting training")
     finetune(
         model,
         tokenizer,
-        # accelerator,
         retriever_args.output_dir,
         dataset_dict['train'],
         dataset_dict['validation'],
+        retriever_args.n_random_negatives
     )
-
-    # Cleans up all of the distributed processes
-    cleanup()
-
 
 if __name__ == "__main__":
     main()
