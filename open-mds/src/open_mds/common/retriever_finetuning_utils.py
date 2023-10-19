@@ -241,12 +241,6 @@ def calculate_auc(scores):
     values, indices = torch.topk(scores, scores.shape[-1], dim=1)
     outputs = torch.nn.functional.sigmoid(scores)
 
-    # Uncomment to get roc scores
-    # roc_scores = roc_auc_score(labels, outputs.squeeze().cpu().numpy().tolist())
-
-    # fpr, tpr, thresholds = metrics.roc_curve(labels.squeeze().cpu().tolist(), outputs.squeeze().cpu().numpy().tolist())
-    # return metrics.auc(fpr, tpr)
-    # return (metrics.roc_curve(labels.squeeze().cpu().tolist(), outputs.squeeze().cpu().numpy().tolist()))
     return metrics.roc_curve(labels.squeeze().cpu().tolist(), outputs.squeeze().cpu().numpy().tolist())
 
 def calculate_mrr(scores):
@@ -269,47 +263,6 @@ def calculate_mrr(scores):
     rr = sum(map(lambda x: 1 / (x.item() + 1), correct_indices))
 
     return rr / size
-
-
-# @torch.no_grad()
-# def calculate_metrics(
-#     model,
-#     batch,
-#     debug=True,
-#     mrr=True,
-#     auc=True
-# ):
-#     """
-#     Calculates accuracy based on the criteria, whether that be:
-#     - Mean Reciprocal Rank (MRR), or
-#     - Area Under Curve (AUC)
-
-#     Includes some debugging in this part if needed
-
-#     TODO: decide if we apply temperature here or not...
-#     """
-
-#     q_tokens, q_mask, p_tokens, p_mask, n_tokens, n_mask = batch.values()
-
-#     p_size = len(p_tokens)
-#     assert p_size == len(n_tokens)
-
-#     q_out = model(q_tokens, q_mask)
-#     p_out = model(p_tokens, p_mask)
-#     n_out = model(n_tokens, n_mask)
-
-#     q_embed = mean_pooling(q_out[0], q_mask)
-#     pn_embed = torch.cat((mean_pooling(p_out[0], p_mask), mean_pooling(n_out[0], n_mask)))
-#     scores = torch.einsum("id, jd->ij", q_embed, pn_embed)
-    
-#     if auc:
-#         # Calculate AUC
-#         auc = calculate_auc(scores)
-#         wandb.log({f"AUC": auc})
-#     if mrr:
-#         # Calculate MRR
-#         mrr = calculate_mrr(scores)
-#         wandb.log({f"MRR": mrr})
 
 def transform_data(pt_dataset, n_random_negatives = 1, splits = ["train", "validation"]):
     """
