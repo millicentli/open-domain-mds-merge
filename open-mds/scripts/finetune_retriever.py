@@ -116,7 +116,7 @@ class RetrieverFinetuningArguments:
         metadata={"help": "The relevance cutoff that we'll use."}
     )
     log_freq: int = field(
-        default=2,
+        default=1000,
         metadata={"help": "How often to log output during training."}
     )
 
@@ -134,6 +134,10 @@ def finetune(
     log_freq=1000,
     relevance_cutoff=100
 ):
+    pt_dataset_do_train = copy.deepcopy(pt_dataset)
+    del pt_dataset_do_train._hf_dataset['train']
+    del pt_dataset_do_train._hf_dataset['test']
+
     # Make the splits
     splits = ["train", "validation"]
     dataset_dict = transform_data(
@@ -207,12 +211,19 @@ def finetune(
 
                 wandb.log({"Training loss": loss.item(), "Learning rate": lr_scheduler.get_lr()[0]})
 
+                # Save the model first here
+                model.module.save_pretrained(f"{output_dir}/model_{step}", from_pt=True)
+                tokenizer.save_pretrained(f"{output_dir}/model_{step}")
+
                 metrics = pt_evaluation(
-                    model.module.name_or_path,
-                    pt_dataset,
+                    f"{output_dir}/model_{step}",
+                    pt_dataset_do_train,
                     output_dir,
-                    relevance_cutoff=relevance_cutoff
+                    relevance_cutoff=relevance_cutoff,
+                    split="validation"
                 )
+
+                print(metrics)
 
                 metrics = metrics.values[0]
                 wandb.log({
@@ -224,7 +235,7 @@ def finetune(
                     f"R@{relevance_cutoff}": metrics[6]
                 })
 
-                # We save a model depending on the P@{relevance_cutoff} value
+                # We save a model depending on the P@{relevance_cutoff} value, call it best_model
                 r_cutoff = metrics[-1]
                 p_cutoff = metrics[-2]
 
@@ -232,9 +243,9 @@ def finetune(
                     max_recall = r_cutoff
                     max_precision = p_cutoff
 
-                    # Save model, tokenizer
-                    model.module.save_pretrained(f"{output_dir}/model_{step}", from_pt=True)
-                    tokenizer.save_pretrained(f"{output_dir}/model_{step}")
+                    # If it's the best model, save it as the best model
+                    model.module.save_pretrained(f"{output_dir}/model_best", from_pt=True)
+                    tokenizer.save_pretrained(f"{output_dir}/model_best")
 
     # Save the very last model anyways, for posterity
     model.module.save_pretrained(f"{output_dir}/model_{step}_last", from_pt=True)
@@ -257,6 +268,7 @@ def finetune(
         
 @torch.no_grad()
 def evaluate(model, tokenizer, eval_dataset, eval_batch_size=1):
+    breakpoint()
     eval_dataset = RetrievalDataset(eval_dataset)
     eval_sampler = SequentialSampler(eval_dataset)
 
@@ -299,7 +311,7 @@ def evaluate(model, tokenizer, eval_dataset, eval_batch_size=1):
     return auc_scores, mrr_scores
 
 @torch.no_grad()
-def pt_evaluation(model_name_or_path, pt_dataset, output_dir, relevance_cutoff=100):
+def pt_evaluation(model_name_or_path, pt_dataset, output_dir, relevance_cutoff=100, split='validation'):
     """
     PyTerrier evaluation -- allows us to evaluate over the entire dataset. Then, we use our
     other evaluation scheme to finally evaluate metrics such as AUC and MRR.
@@ -339,15 +351,15 @@ def pt_evaluation(model_name_or_path, pt_dataset, output_dir, relevance_cutoff=1
         num_results=relevance_cutoff,
         verbose=False,
     )
-    topics = pt_dataset.get_topics('test')
-    qrels = pt_dataset.get_qrels('test')
+    topics = pt_dataset.get_topics(split)
+    qrels = pt_dataset.get_qrels(split)
     retrieved = retrieval_pipeline.transform(topics)
     
     # Metrics: P@1, P@5, P@{relevance_cutoff}, recall@1, recall@5, recall@{relevance_cutoff}
     eval_metrics = ["P_1", "recall_1", "P_5", "recall_5"]
     eval_metrics += [f"P_{relevance_cutoff}", f"recall_{relevance_cutoff}"]
 
-    print(f"[bold]:test_tube: Evaluating retrieved results on the test set [/bold]")
+    print(f"[bold]:test_tube: Evaluating retrieved results on the {split} set [/bold]")
 
     if model_name_or_path == "facebook/contriever":
         name = "Contriever"
@@ -433,15 +445,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(retriever_args.model_name_or_path)
 
     # Put model on DP
+    model.cuda()
     model = DataParallel(model)
 
     # Training here implies also validation
     if training_args.do_train:
         logger.info(f" Starting training!")
-
-        pt_dataset_do_train = copy.deepcopy(pt_dataset)
-        del pt_dataset_do_train._hf_dataset['train']
-        del pt_dataset_do_train._hf_dataset['test']
 
         finetune(
             model,
@@ -470,9 +479,10 @@ def main():
         print(
             pt_evaluation(
                 retriever_args.model_name_or_path,
-                pt_dataset,
+                pt_dataset_do_eval,
                 training_args.output_dir,
-                retriever_args.relevance_cutoff
+                retriever_args.relevance_cutoff,
+                split="test"
             )
         )
 
