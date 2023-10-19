@@ -1,6 +1,10 @@
 import json
+import numpy as np
+import os
+import random
 import re
 import sys
+import torch
 import warnings
 from itertools import zip_longest
 from pathlib import Path
@@ -441,3 +445,28 @@ def load_results_dicts(
     baseline_df = pd.concat(baseline_dfs, ignore_index=True) if baseline_dfs else None
     results_df = pd.concat(results_dfs, ignore_index=True)
     return baseline_df, results_df
+
+def set_seed(seed: int) -> None:
+    """
+    Sets the seed to make everything deterministic, for reproducibility of experiments
+
+    Parameters:
+    seed: the number to set the seed to
+
+    Return: None
+    """
+
+    # Random seed
+    random.seed(seed)
+
+    # Numpy seed
+    np.random.seed(seed)
+
+    # Torch seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
+
+    # os seed
+    os.environ['PYTHONHASHSEED'] = str(seed)
