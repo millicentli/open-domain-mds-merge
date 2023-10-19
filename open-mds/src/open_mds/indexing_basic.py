@@ -38,7 +38,7 @@ class HuggingFacePyTerrierDataset(pt.datasets.Dataset):
         self._hf_dataset = load_dataset(self.path, self.name, **kwargs)
         # datasets = load_dataset(self.path, self.name, split=['train[:25%]', 'validation[:25%]', 'test[:25%]'], **kwargs)
         # datasets = load_dataset(self.path, self.name, split=['train[:01%]', 'validation[:01%]', 'test[:01%]'], **kwargs)
-        # datasets = load_dataset(self.path, self.name, split=['train[:10%]', 'validation[:10%]', 'test[:10%]'], **kwargs)
+        # datasets = load_dataset(self.path, self.name, split=['train[:02%]', 'validation[:02%]', 'test[:02%]'], **kwargs)
 
         # from datasets import DatasetDict
         # self._hf_dataset = DatasetDict()
@@ -109,47 +109,6 @@ class MSLR2022Dataset(HuggingFacePyTerrierDataset):
                 for docno, title, abstract in zip(example["pmid"], example["title"], example["abstract"]):
                     self._documents[docno] = {"title": title, "abstract": abstract}
 
-    def reconstruct(
-        self, dataset: Dataset, retrieved: pd.DataFrame, subsets: int
-    ) -> Dataset:
-        """
-        Converts the retrieved values into a dataset
-        """
-
-        # Get the qids
-        examples = {}
-        review_id = []
-        pmid = []
-        title = []
-        abstract = []
-        targets = []
-        backgrounds = []
-        for qid, target, background in zip(dataset['review_id'], dataset['target'], dataset['background']):
-            pmid_list = []
-            title_list = []
-            abstract_list = []
-            for subset in range(subsets):
-                docs = retrieved.loc[retrieved.qid == qid].loc[retrieved.subset == subset]["docno"].tolist()
-                pmid_list.append([docno for docno in docs])
-                title_list.append([self._documents[docno]["title"] for docno in docs])
-                abstract_list.append([self._documents[docno]["abstract"] for docno in docs])
-
-            review_id.append(qid)
-            targets.append(target)
-            backgrounds.append(background)
-            pmid.append(pmid_list)
-            title.append(title_list)
-            abstract.append(abstract_list)
-
-        examples["review_id"] = review_id
-        # examples["subset_list"] = subset_list
-        examples["pmid"] = pmid
-        examples["title"] = title
-        examples["abstract"] = abstract
-        examples["target"] = targets
-        examples["background"] = backgrounds
-
-        return Dataset.from_dict(examples)
 
     def replace(
         self, example: Dict[str, Any], idx: int, *, split: str, qid_to_docnos: Dict[str, int]
@@ -160,18 +119,6 @@ class MSLR2022Dataset(HuggingFacePyTerrierDataset):
         example["title"] = [[self._documents[docno]["title"] for docno in docno_list] for docno_list in docnos]
         example["abstract"] = [[self._documents[docno]["abstract"] for docno in docno_list] for docno_list in docnos]
         return example
-
-
-        
-    # def recombine(
-    #     self, dataset: Dataset
-    # ) -> Dataset:
-    #     """
-    #     After reconstructing the dataset, recombine so that the subsets are together (makes it easier to sample)
-    #     """
-    #     review_ids = set(dataset['review_ids'])
-
-
 
     def get_corpus_iter(self, verbose: bool = False):
         yielded = set()
@@ -202,42 +149,11 @@ class MSLR2022Dataset(HuggingFacePyTerrierDataset):
         # return _sanitize_query(topics)
         return topics
 
-    # def get_qrels(self, split: str) -> pd.DataFrame:
-    #     dataset = self._hf_dataset[split]
-    #     qids, docnos = [], []
-    #     for example in dataset:
-    #         breakpoint()
-    #         qids.extend([example["review_id"]] * len(example["pmid"]))
-    #         docnos.extend(example["pmid"])
-    #     labels = [1] * len(qids)
-    #     return pd.DataFrame({"qid": qids, "docno": docnos, "label": labels})
-
-    # def get_document_stats(
-    #     self, avg_tokens_per_doc: bool = False, avg_tokens_per_summary: bool = False, **kwargs
-    # ) -> Dict[str, float]:
-    #     num_docs: List[int] = []
-    #     doc_lens: List[int] = []
-    #     summ_lens: List[int] = []
-    #     max_documents = kwargs.get("max_documents")
-    #     for split in self._hf_dataset:
-    #         for example in self._hf_dataset[split]:
-    #             num_studies = len(example["pmid"])
-    #             num_docs.append(min(num_studies, max_documents) if max_documents else num_studies)
-
-    #             if avg_tokens_per_doc:
-    #                 doc_lens.extend(len(wordpunct_tokenize(doc.strip())) for doc in example["abstract"])
-    #             if avg_tokens_per_summary:
-    #                 summ_lens.append(len(wordpunct_tokenize(example["target"].strip())))
-    #     stats = {
-    #         "max": np.max(num_docs),
-    #         "mean": np.mean(num_docs),
-    #         "min": np.min(num_docs),
-    #         "sum": np.sum(num_docs),
-    #     }
-
-    #     if avg_tokens_per_doc:
-    #         stats["avg_tokens_per_doc"] = np.mean(doc_lens)
-    #     if avg_tokens_per_summary:
-    #         stats["avg_tokens_per_summary"] = np.mean(summ_lens)
-
-    #     return stats
+    def get_qrels(self, split: str) -> pd.DataFrame:
+        dataset = self._hf_dataset[split]
+        qids, docnos = [], []
+        for example in dataset:
+            qids.extend([example["review_id"]] * len(example["pmid"]))
+            docnos.extend(example["pmid"])
+        labels = [1] * len(qids)
+        return pd.DataFrame({"qid": qids, "docno": docnos, "label": labels})
