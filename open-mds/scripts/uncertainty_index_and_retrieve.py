@@ -10,7 +10,14 @@ The pipeline is:
 
 Q: index the files first or determine them based on relevance?
 Example command:
-python ./scripts/uncertainty_index_and_retrieve.py "ms2" "./output/datasets/ms2_full"
+python ./scripts/uncertainty_index_and_retrieve.py "ms2" "./output/datasets/ms2_full" 2
+
+
+How do we run this?
+python ./scripts/uncertainty_index_and_retrieve.py \
+        "ms2" "./output/datasets/tiny_ms2_retrieved_split=1" \
+        1 \
+        --model-name-or-path "/scratch/li.mil/open-domain-mds-merge/contriever_ms2/model_best" 
 """
 
 # 1. Convert all documents into the embeds and store in faiss dataframe
@@ -22,10 +29,7 @@ from enum import Enum
 from pathlib import Path
 from typing import List
 
-# import faiss
-# from contriever.src.contriever import Contriever
 from functools import partial
-from contriever.src.index import Indexer
 from rich import print
 from sklearn.linear_model import LogisticRegression as lr
 from transformers import AutoModel, AutoTokenizer
@@ -41,11 +45,6 @@ from open_mds import indexing_basic
 from open_mds.common import util
 
 app = typer.Typer()
-
-# The maximum number of results to retrieve per query. Large values will increase the amount of memory consumed.
-# This is a good default and likely only needs to be changed if you wish to evaluate Recall at values > 1000.
-# This could be made an argument to the script.
-_NUM_RESULTS_PER_QUERY = 100
 
 # The default location to save document indices.
 _DOCUMENT_INDEX_DIR = Path(util.CACHE_DIR) / "indices"
@@ -69,29 +68,6 @@ class Dataset(str, Enum):
     Check the source of queries for the other datasets
     """
 
-class Retriever(str, Enum):
-    sparse = "sparse"
-    dense = "dense"
-
-
-class TopKStrategy(str, Enum):
-    mean = "mean"
-    max_ = "max"
-    oracle = "oracle"
-
-# def mean_pooling(token_embeddings, mask):
-#     token_embeddings = token_embeddings.masked_fill(~mask[..., None].bool(), 0.)
-#     sentence_embeddings = token_embeddings.sum(dim=1) / mask.sum(dim=1)[..., None]
-#     return sentence_embeddings
-
-# def chunk(docs):
-#     # Change this magic number
-#     for shard in more_itertools.chunked(docs, _BATCH_SIZE):
-#         yield {
-#             "docno": [s["docno"] for s in shard],
-#             "text": [t["text"] for t in shard]
-#         }
-
 def construct_data(review_ids, pmids, retrieved):
     all_pmid_results = []
     all_neg_pmid_results = []
@@ -112,25 +88,12 @@ def construct_data(review_ids, pmids, retrieved):
                 new_scores.append(docs[docs.docno == doc]['score'].item())
                 new_labels.append(1)
 
-        # pmid_results = [
-        #     (doc, docs[docs.docno == doc]['score'].item()) \
-        #     for doc in list(docs.docno) if doc in pmid
-        # ]
-
-        # Randomly sample some negative examples around the length of the # of review IDs
         neg_sampled = not_docs.sample(n=len(docs.docno), random_state=42)
-        # neg_pmid_results = [
-        #     (docno, score) for docno, score in zip(neg_sampled.docno, neg_sampled.score)
-        # ]
+
         for docno, score in zip(neg_sampled.docno, neg_sampled.score):
             new_pmids.append(docno)
             new_scores.append(score)
             new_labels.append(0)
-
-        # assert len(pmid_results) == len(neg_pmid_results)
-
-        # all_pmid_results.append(pmid_results)
-        # all_neg_pmid_results.append(neg_pmid_results)
 
     # Now, fashion it for training by putting it into a df
     data_dict = {"review_id": new_pmids, "score": new_scores, "label": new_labels}
@@ -156,22 +119,12 @@ def train_logreg(hf_dataset, retrieved, split='train'):
     # Shuffling
     df = df.sample(frac = 1)
 
-    # features = ["review_id", "score"]
     features = ["score"]
     X = df[features]
     y = df.label
 
-
-    # from sklearn.model_selection import train_test_split
-
-    # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=16)
-
-
-    # x = data[]
     logreg = lr(random_state=42)
     logreg.fit(X, y)
-
-    # y_pred = logreg.predict(X_test)
 
     return logreg
     
@@ -209,12 +162,13 @@ def main(
     ),
     relevance_cutoff: int = typer.Argument(
         100,
-        help="Percent cutoff for document relevance (if 100, 100%\ of documents are relevant)"
+        help="Number of documents to cut off for relevance; num_results_per_query basically, so the number of results to retrieve per query. 
+             " Only really change if you want to be able to retrieve from a larger swath of documents.
     ),
-    num_docs: int = typer.Argument(
-        10,
-        help="Number of docs we want per subsets"
-    ),
+    # num_docs: int = typer.Argument(
+    #     10,
+    #     help="Number of docs we want per subsets"
+    # ),
     splits: List[str] = typer.Option(
         None, help="Which splits of the dataset to replace with retrieved documents. Defaults to all splits."
     ),
@@ -246,6 +200,8 @@ def main(
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     model = AutoModel.from_pretrained(model_name_or_path).to(device)
 
+    print(f"[bold blue]:information: Model chosen: {model_name_or_path}")
+
     # Any dataset specific setup goes here
     if hf_dataset_name == Dataset.multinews:
         path = "multi_news"
@@ -267,7 +223,6 @@ def main(
     if pt_dataset.name is not None:
         index_path = index_path / pt_dataset.name
     index_path.mkdir(parents=True, exist_ok=True)
-
     # Use all splits if not specified
     splits = splits or list(pt_dataset._hf_dataset.keys())
     print(f"[bold blue]:information: Will replace documents in {', '.join(splits)} splits")
@@ -285,11 +240,12 @@ def main(
         normalize=False,
         verbose=False,
     )
+
     indexer.index(pt_dataset.get_corpus_iter(verbose=True))
     retrieval_pipeline = SentenceTransformersRetriever(
         model_name_or_path=model_name_or_path,
         index_path=str(index_path),
-        num_results=_NUM_RESULTS_PER_QUERY,
+        num_results=relevance_cutoff,
         verbose=False,
     )
 
@@ -330,18 +286,19 @@ def main(
         for qid in qid_list:
             selected_docnos = []
             for subset in range(subsets):
-                related = retrieved[retrieved.qid == qid]
+                # related = retrieved[retrieved.qid == qid]
                 # We want to take a percentage here and sample from most relevant; let's make
                 # a cutoff
                 # Calculate the percentage
-                num_docs = int((relevance_cutoff / 100) * len(related))
-                related = related.head(num_docs)
-                related = related.sample(frac=1, random_state=42)
+                # num_docs = int((relevance_cutoff / 100) * len(related))
+                # related = related.head(num_docs)
+                # related = related.sample(frac=1, random_state=42)
+                related = retrieved[retrieved.qid == qid].sample(frac=1, random_state=42)
                 related['selected'] = related.apply(sample_bern, axis=1)
                 selected = related[related.selected == 1]
                 selected_docnos.append(list(selected.docno))
             qid_to_docnos[qid] = selected_docnos            
-
+        
         print("After creating dataframe!")
         # Now I have the set of documents; assemble a new dataset that copies the prev
         hf_dataset[split] = hf_dataset[split].map(

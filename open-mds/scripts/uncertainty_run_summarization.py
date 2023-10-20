@@ -16,12 +16,12 @@
 """
 Fine-tuning the library models for sequence to sequence.
 
+Used for evaluating our models on marginalizing over uncertainty. EVAL ONLY.
+
 To run:
 python ./scripts/uncertainty_run_summarization.py "./conf/base.yml" "./conf/ms2/led-base/eval.yml" \
     output_dir="./output/ms2_split=2/led-base/" \
-    dataset_name="./output/datasets/ms2_split=2/" \
-    2 \
-    10 \
+    dataset_name="./output/datasets/ms2_split=2/"
 """
 # You can also adapt this script on your own sequence to sequence task. Pointers for this are left as comments.
 
@@ -920,34 +920,11 @@ def main():
             ]
         )
 
-        # model_kwargs = {}
-        # Init all model kwargs here per the # of times sampled
-        # model_kwargs_list = [
-        #     "encoder_outputs": model.get_encoder()(
-        #         encoder_input_ids.repeat_interleave(num_beams, dim=0), return_dict=True
-        #     ) for subset in subsets
-        # ] # Should be number of number of subsets x number of beams, since each subset will have 3 beams to average over
-
-        # Generating one token at a time:
-        # https://stackoverflow.com/questions/72486821/summarization-with-huggingface-how-to-generate-one-word-at-a-time
         model.eval()
         model.to(device)
         final_outputs = []
         for step, inputs in tqdm(enumerate(dataloader), total=len(dataloader)):
-            # breakpoint()
-            # print("Here's inputs:", inputs[0]['input_ids'])
-            # print(tokenizer.batch_decode(inputs[0]['input_ids']))
-            # sequence_outputs = evaluate.modified_beam_search(
-            #     inputs,
-            #     model,
-            #     tokenizer,
-            #     # beam_scorer,
-            #     logits_processor,
-            #     num_beams=num_beams,
-            #     device=device
-            # )
             # TODO: Put inputs on device before sending it into generate
-            # print(inputs[0]['input_ids'].device)
             inputs = [
                 {
                     'input_ids': i['input_ids'].cuda(),
@@ -966,9 +943,6 @@ def main():
                 max_length=100,
             )
 
-            # breakpoint()
-            # print("Here's sequence_outputs:", sequence_outputs)
-            # print(tokenizer.batch_decode(sequence_outputs['sequences']))
             # inputs_list = [i.cpu() for i in inputs_list]
             inputs_list = [i['input_ids'].cpu() for i in inputs]
             final_outputs.append({
