@@ -1,5 +1,9 @@
+"""
+For finetuning a custom retriever.
+"""
+
 # RetrieverTrainingArguments
-model_name_or_path: "facebook/contriever"
+model_name_or_path: "facebook/contriever-msmarco"
 hf_dataset_name: "ms2"
 
 # TrainingArguments
