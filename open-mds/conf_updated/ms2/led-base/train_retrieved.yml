@@ -4,6 +4,7 @@ model_name_or_path: "allenai/led-base-16384"
 # DataTrainingArguments
 # dataset_name: "allenai/ms2_dense_mean" # Add my own
 dataset_name: "/home/li.mil/open-domain-mds-merge/open-mds/output/datasets/ms2_retrieved_split=1"
+dataset_config_name: "ms2"
 text_column: "background"
 summary_column: "target"
 max_source_length: 16384
@@ -12,19 +13,23 @@ max_target_length: 256
 # Seq2SeqTrainingArguments
 # See: https://huggingface.co/docs/transformers/main_classes/trainer#transformers.Seq2SeqTrainingArguments
 do_train: true
+do_eval: true
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1
 # per_device_train_batch_size = 1 * gradient_accumulation_steps = 16 = total effective batch size of 16
 gradient_accumulation_steps: 16
 learning_rate: 3e-5
 weight_decay: 0.01
-num_train_epochs: 3
-warmup_ratio: 0.10
+num_train_epochs: 20
+warmup_ratio: 0.1
 label_smoothing_factor: 0.1
+# Controls the evaluation strategy
+evaluation_strategy: "steps"
+eval_steps: 500
+eval_delay: 5000
 # Controls the checkpointing strategy
 save_strategy: "steps"
-# 14188 examples * 3 epochs / batch size of 16 = 2660 steps. For 12 evaluations we need 2660 / 12 = 221 steps
-save_steps: 221
-save_total_limit: 12
-# We generally won't be extending training, so default to overwriting the existing checkpoint
-overwrite_output_dir: true
+save_steps: 500
+save_total_limit: 1
+load_best_model_at_end: true
+metric_for_best_model: "bertscore_f1_mean"

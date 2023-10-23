@@ -235,6 +235,23 @@ def preprocess_ms2(
     summary = summary.strip()
     return text, summary
 
+def preprocess_ms2_finetuning(
+    text: str,
+    summary: str,
+    titles: List[str],
+    abstracts: List[str],
+    doc_sep_token: str,
+    max_included_studies: int = 25,
+) -> Tuple[str, str]:
+    breakpoint()
+    background = text.strip()
+    articles = [f"{title.strip()} {abstract.strip()}" for title, abstract in zip(titles[0], abstracts[0])]
+    # Following https://aclanthology.org/2021.emnlp-main.594/, take the first 25 articles.
+    articles = articles[:max_included_studies]
+    text = f" {doc_sep_token} ".join([background] + articles)
+    summary = summary.strip()
+    return text, summary
+
 def preprocess_ms2_marginalization(
     text: str,
     summary: str,

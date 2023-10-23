@@ -32,8 +32,8 @@ python ./scripts/finetune_summarization.py "./conf/base.yml" "./conf_updated/ms2
         dataset_name="allenai/mslr2022"
 
 For training on the re-retrieved dataset:
-python ./scripts/finetune_summarization.py "./conf/base.yml" "./conf_updated/ms2/led-base/train_reretrieved.yml" \
-        output_dir="./output/ms2/led-base/reretrieved" \
+python ./scripts/finetune_summarization.py "./conf/base.yml" "./conf_updated/ms2/led-base/train_retrieved.yml" \
+        output_dir="./output/ms2/led-base/retrieved" \
         dataset_name="/home/li.mil/open-domain-mds-merge/open-mds/output/datasets/ms2_retrieved_split=1"
 
 testing on the small subset, original:
@@ -648,13 +648,22 @@ def main():
                         doc_sep_token=doc_sep_token,
                     )
                 elif data_args.dataset_config_name == "ms2" or "ms2" in data_args.dataset_name:
-                    text, summary = util.preprocess_ms2(
-                        text=examples[text_column][i],
-                        summary=examples[summary_column][i],
-                        titles=examples["title"][i],
-                        abstracts=examples["abstract"][i],
-                        doc_sep_token=doc_sep_token,
-                    )
+                    if "retrieved" in data_args.dataset_name:
+                        text, summary = util.preprocess_ms2_finetuning(
+                            text=examples[text_column][i],
+                            summary=examples[summary_column][i],
+                            titles=examples["title"][i],
+                            abstracts=examples["abstract"][i],
+                            doc_sep_token=doc_sep_token,
+                        )
+                    else:
+                        text, summary = util.preprocess_ms2(
+                            text=examples[text_column][i],
+                            summary=examples[summary_column][i],
+                            titles=examples["title"][i],
+                            abstracts=examples["abstract"][i],
+                            doc_sep_token=doc_sep_token,
+                        )
                 elif data_args.dataset_config_name == "cochrane" or "cochrane" in data_args.dataset_name:
                     text, summary = util.preprocess_cochrane(
                         summary=examples[summary_column][i],
@@ -682,42 +691,6 @@ def main():
         # Before we perturb...
         # record the number of documents in each instance
         orig_num_docs = [util.get_num_docs(text, doc_sep_token=doc_sep_token) for text in inputs]
-
-        if perturbation_args.perturbation is None:
-            logger.info("No perturbations will be applied.")
-        else:
-            perturber = Perturber(
-                perturbation_args.perturbation,
-                doc_sep_token=doc_sep_token,
-                strategy=perturbation_args.selection_strategy,
-                seed=perturbation_args.perturbed_seed,
-            )
-
-            unperturbed_indices = None
-            # Both Multi-XScience and MS^2 examples begin with a "special" document, the abstract of the paper
-            # whos related works section we are trying to generate, and the background section of the literature
-            # review we are trying to generate, respectively. Both of these should be excluded from perturbation,
-            # as they are not something we would retrieve.
-            if (
-                data_args.dataset_name == "multi_x_science_sum"
-                or "multixscience" in data_args.dataset_name
-                or data_args.dataset_config_name == "ms2"
-                or "ms2" in data_args.dataset_name
-            ):
-                unperturbed_indices = [0]
-                logger.info(f"Documents at indices '{unperturbed_indices}' will not be perturbed.")
-
-            inputs = perturber(
-                inputs,
-                perturbed_frac=perturbation_args.perturbed_frac,
-                targets=targets,
-                documents=documents,
-                unperturbed_indices=unperturbed_indices,
-            )
-            logger.info(
-                f"Applying perturbation '{perturbation_args.perturbation}' with selection strategy"
-                f" '{perturbation_args.selection_strategy}'."
-            )
 
         # Rather than naively truncating the concatenated documents, we follow
         # https://aclanthology.org/2021.naacl-main.380/ and https://arxiv.org/abs/2110.08499
@@ -767,22 +740,6 @@ def main():
     doc_sep_token = util.get_doc_sep_token(tokenizer)
     logger.info(f"Using {doc_sep_token} as the document seperator token.")
 
-    # Certain perturbations require us to provide all examples in the dataset, collect those here
-    documents = None
-    if perturbation_args.perturbation in ["addition", "replacement"] and perturbation_args.perturbed_frac:
-        documents = []
-        for split in raw_datasets:
-            preprocessed_dataset = raw_datasets[split].map(
-                _preprocess_batch,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc=f"Collecting documents from {split} set",
-            )
-            documents.extend(preprocessed_dataset["inputs"])
-        logger.info(f"Loaded {len(documents)} documents. These will be included for selection during perturbation.")
-
     if training_args.do_train:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
@@ -800,6 +757,16 @@ def main():
                 desc="Running tokenizer on train dataset",
                 batch_size=4096,
             )
+
+
+    # from datasets import Dataset
+    # d = {
+    #     "input_ids": train_dataset[:10]['input_ids'],
+    #     "attention_mask": train_dataset[:10]['attention_mask'],
+    #     "labels": train_dataset[:10]['labels'],
+    #     "global_attention_mask": train_dataset[:10]['global_attention_mask']
+    # }
+    # train_dataset = Dataset.from_dict(d)
 
     if training_args.do_eval:
         max_target_length = data_args.val_max_target_length
@@ -819,7 +786,7 @@ def main():
                 desc="Running tokenizer on validation dataset",
                 batch_size=None,
             )
-
+    # eval_dataset = Dataset.from_dict(d)
     if training_args.do_predict:
         max_target_length = data_args.val_max_target_length
         if "test" not in raw_datasets:
@@ -851,6 +818,7 @@ def main():
     # Metrics
 
     def compute_metrics(eval_preds):
+        # breakpoint()
         preds, labels, inputs = eval_preds.predictions, eval_preds.label_ids, eval_preds.inputs
         if isinstance(preds, tuple):
             preds = preds[0]
@@ -908,7 +876,7 @@ def main():
         "dataset_name": data_args.dataset_name,
         "dataset_config_name": data_args.dataset_config_name,
     }
-
+    # breakpoint()
     # Initialize our Trainer
     trainer = Seq2SeqTrainer(
         model=model,
@@ -953,6 +921,7 @@ def main():
     num_beams = data_args.num_beams if data_args.num_beams is not None else training_args.generation_num_beams
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
+        # breakpoint()
         metrics = trainer.evaluate(max_length=max_length, num_beams=num_beams, metric_key_prefix="eval")
         max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))

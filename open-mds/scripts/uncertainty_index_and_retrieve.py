@@ -162,8 +162,9 @@ def main(
     ),
     relevance_cutoff: int = typer.Argument(
         100,
-        help="Number of documents to cut off for relevance; num_results_per_query basically, so the number of results to retrieve per query. 
-             " Only really change if you want to be able to retrieve from a larger swath of documents.
+        help="Number of documents to cut off for relevance; num_results_per_query basically, so "
+             "the number of results to retrieve per query. "
+             " Only really change if you want to be able to retrieve from a larger swath of documents."
     ),
     # num_docs: int = typer.Argument(
     #     10,
