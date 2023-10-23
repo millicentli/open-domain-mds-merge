@@ -14,8 +14,8 @@ source ~/.bashrc
 
 python ./scripts/finetune_retriever.py \
         "./conf_retriever/base.yml" \
-        "./conf_retriever/ms2/contriever/finetune.yml" \
-        model_name_or_path="facebook/contriever" \
-        output_dir="/scratch/li.mil/open-domain-mds-merge/contriever_ms2" \
+        "./conf_retriever/ms2/contriever-msmarco/finetune.yml" \
+        model_name_or_path="facebook/contriever-msmarco" \
+        output_dir="/scratch/li.mil/open-domain-mds-merge/contriever_msmarco_ms2" \
         do_train=True \
         do_eval=True
