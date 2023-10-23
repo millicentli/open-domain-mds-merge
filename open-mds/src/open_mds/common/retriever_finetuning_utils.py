@@ -61,10 +61,12 @@ class RetrievalDataset(torch.utils.data.Dataset):
             return example
         else:
             # In the validation case, we want to return all possible outputs to evaluate
+            # TODO: remove the queries -- only need qids for the golds and negs
             example = {
-                "query": self.normalize_fn(question),
-                "gold": [self.normalize_fn(gold["text"]) for gold in example["positive_ctxs"]],
-                "negatives": [self.normalize_fn(n["text"]) for n in example["negative_ctxs"]]
+                "query": self.normalize_fn(question[0]),
+                "qids": question[1],
+                "gold": example["positive_ctxs"],
+                "negatives": example["negative_ctxs"]
             }
             
             return example
@@ -124,20 +126,14 @@ class TrainCollator(object):
             "n_mask": nout["attention_mask"]
         }
 
-
 class EvalCollator(object):
     """
-    Define a collate function where we want to tokenize the following tokens:
-    - q (query/text) tokens
-    - p tokens
-    - n tokens
+    For this collator function, we don't really care about the negatives and positives as embeds.
+    Instead, we want to get all of the possible pmids and then convert to 0's and 1's for labels.
 
-    For eval, our batch is the set of documents related to the question (and the
-    associated negatives) per sample.
-
-    TODO: if possible, support:
-    - In-batch negatives
-    - Multiple negatives
+    Map these doc ids to 1s, 0s for each label.
+    
+    TODO: remove the queries -- only need qids for the golds and negs
     """
 
     def __init__(self, tokenizer, passage_maxlength=400):
@@ -146,11 +142,17 @@ class EvalCollator(object):
 
     def __call__(self, batch):
         queries = [b['query'] for b in batch]
-        if len(batch) == 1:
-            positives = [item for item in batch[0]["gold"]]
-            negatives = [item for item in batch[0]["negatives"]]
-        else:
-            raise NotImplementedError # Not sure if > 1 can be implemented
+        qids = [b['qids'] for b in batch]
+
+        gold_size = max([len(b['gold']) for b in batch])
+        neg_size = max([len(b['negatives']) for b in batch])
+
+        # Pad the positives, negatives
+        gold_padded = []
+        neg_padded = []
+        for b in batch:
+            gold_padded.append(b['gold'] + [None] * (gold_size - len(b['gold'])))
+            neg_padded.append(b['negatives'] + [None] * (neg_size - len(b['negatives'])))
 
         qout = self.tokenizer.batch_encode_plus(
             queries,
@@ -161,30 +163,12 @@ class EvalCollator(object):
             return_tensors="pt",
         )
 
-        pout = self.tokenizer.batch_encode_plus(
-            positives,
-            max_length=self.passage_maxlength,
-            truncation=True,
-            padding=True,
-            add_special_tokens=True,
-            return_tensors="pt"
-        )
-        nout = self.tokenizer.batch_encode_plus(
-            negatives,
-            max_length=self.passage_maxlength,
-            truncation=True,
-            padding=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-
         return {
             "q_tokens": qout["input_ids"],
             "q_mask": qout["attention_mask"],
-            "p_tokens": pout["input_ids"],
-            "p_mask": pout["attention_mask"],
-            "n_tokens": nout["input_ids"],
-            "n_mask": nout["attention_mask"]
+            "qids": qids,
+            "gold": gold_padded,
+            "negatives": neg_padded
         }
 
 def mean_pooling(token_embeddings, mask):
@@ -228,22 +212,56 @@ def contrastive_loss(
 
     return loss
 
-def calculate_auc(scores):
+def calculate_auc(scores, qids, gold, neg):
     """
-    Calculates AUC given our inputs.
-
-    First, take our input scores, see if it's in the correct side (1 if correct, 0 otherwise)
+    Calculates ROC AUC given our inputs
     """
-    labels = torch.zeros_like(scores)
-    size = int(scores.size()[-1] / 2)
-    labels[:, :size] = 1
+    auc_scores = []
+    for qid, g, n in zip(qids, gold, neg):
+        g_labels = [1 for i in g if i is not None]
+        n_labels = [0 for i in n if i is not None]
+        all_labels = g_labels + n_labels
 
-    values, indices = torch.topk(scores, scores.shape[-1], dim=1)
-    outputs = torch.nn.functional.sigmoid(scores)
+        gold_scores = scores[(scores.qid == qid) & (scores.docno.isin(filter(lambda x: x != None, g)))]
+        neg_scores = scores[(scores.qid == qid) & (scores.docno.isin(filter(lambda x: x != None, n)))]
 
-    return metrics.roc_curve(labels.squeeze().cpu().tolist(), outputs.squeeze().cpu().numpy().tolist())
+        gold_scores = gold_scores['score'].tolist()
+        neg_scores = neg_scores['score'].tolist()
+        all_scores = gold_scores + neg_scores
 
-def calculate_mrr(scores):
+        assert len(all_labels) == len(all_scores)
+
+        roc_auc_score = metrics.roc_auc_score(all_labels, all_scores)
+        auc_scores.append(roc_auc_score)
+
+    return sum(auc_scores) / len(auc_scores)
+
+def calculate_auprc(scores, qids, gold, neg):
+    """
+    Calculates AUPRC.
+    """
+
+    auprc_scores = []
+    for qid, g, n in zip(qids, gold, neg):
+        g_labels = [1 for i in g if i is not None]
+        n_labels = [0 for i in n if i is not None]
+        all_labels = g_labels + n_labels
+
+        gold_scores = scores[(scores.qid == qid) & (scores.docno.isin(filter(lambda x: x != None, g)))]
+        neg_scores = scores[(scores.qid == qid) & (scores.docno.isin(filter(lambda x: x != None, n)))]
+
+        gold_scores = gold_scores['score'].tolist()
+        neg_scores = neg_scores['score'].tolist()
+        all_scores = gold_scores + neg_scores
+
+        assert len(all_labels) == len(all_scores)
+
+        auprc = metrics.average_precision_score(all_labels, all_scores)
+        auprc_scores.append(auprc)
+
+    return sum(auprc_scores) / len(auprc_scores)
+
+def calculate_mrr(scores, qids, gold, neg):
     """
     Calculate MRR given we know our gold answers.
     The correct scores are the first scores.size()[-1] / 2 -- take those, get the MRR.
@@ -251,18 +269,19 @@ def calculate_mrr(scores):
     The higher the MRR, the better.
     A score of 0 means that nothing was correct.
     """
-    labels = torch.zeros_like(scores)
-    size = int(scores.size()[-1] / 2)
-    labels[:, :size] = 1
 
-    sorted_scores, indices = torch.sort(scores, descending=True)
+    mrr_scores = []
+    for qid, g, n in zip(qids, gold, neg):
+        gold = list(filter(lambda x: x != None, g))
+        neg = list(filter(lambda x: x != None, n))
 
-    correct_mask = (indices < size).squeeze()
-    correct_indices = torch.arange(indices.size()[-1], device=indices.device)[correct_mask]
+        indices = list(scores[(scores.qid == qid) & (scores.docno.isin(g))]['rank'])
 
-    rr = sum(map(lambda x: 1 / (x.item() + 1), correct_indices))
+        size = len(indices)
+        rr = sum(map(lambda x: 1 / (x + 1), indices))
+        mrr_scores.append(rr / size)
 
-    return rr / size
+    return sum(mrr_scores) / len(mrr_scores)
 
 def transform_data(pt_dataset, n_random_negatives = 1, splits = ["train", "validation"]):
     """
@@ -271,7 +290,7 @@ def transform_data(pt_dataset, n_random_negatives = 1, splits = ["train", "valid
     """
 
     hf_dataset = copy.deepcopy(pt_dataset._hf_dataset)
-    
+
     split_dict = {}
     for split in splits:
         topics = pt_dataset.get_topics(split)
@@ -282,26 +301,30 @@ def transform_data(pt_dataset, n_random_negatives = 1, splits = ["train", "valid
 
         # Get all possible pmids and their corresponding data
         for idx, (query, data) in enumerate(zip(topics['query'], hf_dataset[split])):
-            # print("Here'x idx:", idx)
             positive_pmids = data['pmid']
             subset_pmids = [pmid for pmid in all_pmids if pmid not in positive_pmids]
             if split == "train":
                 negative_pmids = random.sample(subset_pmids, n_random_negatives)
+
+                positive_ctxs = [{"text": pmids_to_abstracts[pmid]} for pmid in positive_pmids]
+                negative_ctxs = [{"text": pmids_to_abstracts[pmid]} for pmid in negative_pmids]
+
+                # Assertion to make sure we aren't double dipping
+                assert positive_pmids[0] not in negative_pmids
+                
+                example = {}
+                example['question'] = query
+                example['positive_ctxs'] = positive_ctxs
+                example['negative_ctxs'] = negative_ctxs
+                all_examples.append(example)
             else:
-                # If eval, our neg_pmids are dependent on size of train
-                negative_pmids = random.sample(subset_pmids, len(positive_pmids))
-
-            positive_ctxs = [{"text": pmids_to_abstracts[pmid]} for pmid in positive_pmids]
-            negative_ctxs = [{"text": pmids_to_abstracts[pmid]} for pmid in negative_pmids]
-
-            # Assertion to make sure we aren't double dipping
-            assert positive_pmids[0] not in negative_pmids
-            
-            example = {}
-            example['question'] = query
-            example['positive_ctxs'] = positive_ctxs
-            example['negative_ctxs'] = negative_ctxs
-            all_examples.append(example)
+                # If eval, we want to evaluate over the entire output dataset. So here,
+                # we only really care about the pmids and their associated labels.
+                example = {}
+                example['question'] = (query, data['review_id'])
+                example['positive_ctxs'] = positive_pmids
+                example['negative_ctxs'] = subset_pmids
+                all_examples.append(example)
 
         split_dict[split] = all_examples
 

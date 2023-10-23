@@ -21,18 +21,17 @@ To use: make sure to do: export PYTHONPATH="${PYTHONPATH}:/home/li.mil/open-doma
 
 
 To run the command:
-python ./scripts/finetune_retriever.py "./conf_retriever/base.yml" "./conf_retriever/ms2/led-base/finetune.yml" \
-    output_dir="./output/models/contriever" \
+python ./scripts/finetune_retriever.py "./conf_retriever/base.yml" "./conf_retriever/ms2/contriever/finetune.yml" \
+    output_dir="./output/models/contriever"
 
-python ./scripts/finetune_retriever.py "./conf_retriever/base.yml" "./conf_retriever/ms2/led-base/finetune.yml" \
-    output_dir="/scratch/li.mil/open-domain-mds-merge/contriever" \
+python ./scripts/finetune_retriever.py "./conf_retriever/base.yml" "./conf_retriever/ms2/contriever/finetune.yml" \
+    output_dir="/scratch/li.mil/open-domain-mds-merge/contriever"
 
-To put in scratch dir: /scratch/li.mil/open-domain-mds-merge/contriever
+To put in scratch dir: 
+python ./scripts/finetune_retriever.py "./conf_retriever/base.yml" "./conf_retriever/ms2/contriever/finetune.yml" \
+    output_dir="/scratch/li.mil/open-domain-mds-merge/contriever"
 
 Plotting ROC Curve: https://stackoverflow.com/questions/25009284/how-to-plot-roc-curve-in-python
-
-
-TODO: Add distributed training. Eval can simply be the accuracy and loss for now.
 """
 
 import copy
@@ -75,9 +74,13 @@ from src.open_mds.common.retriever_finetuning_utils import (
     contrastive_loss,
     calculate_auc,
     calculate_mrr,
+    calculate_auprc,
     transform_data,
     RetrievalDataset
 )
+
+import pyterrier as pt
+from pyterrier_sentence_transformers import SentenceTransformersIndexer, SentenceTransformersRetriever
 
 """
 Distributed training with DP
@@ -123,13 +126,14 @@ class RetrieverFinetuningArguments:
 def finetune(
     model,
     tokenizer,
+    model_name_or_path,
     output_dir,
     pt_dataset,
     n_random_negatives,
     lr=1e-4,
     num_epochs=1,
     train_batch_size=32,
-    eval_batch_size=1, # TODO: figure out if it's batchable. Don't think it is because OOM
+    eval_batch_size=1,
     weight_decay=0.01,
     log_freq=1000,
     relevance_cutoff=100
@@ -231,11 +235,16 @@ def finetune(
                     "R@1": metrics[2],
                     "P@5": metrics[3],
                     "R@5": metrics[4],
-                    f"P@{relevance_cutoff}": metrics[5],
-                    f"R@{relevance_cutoff}": metrics[6]
+                    "P@20": metrics[5],
+                    "R@20": metrics[6],
+                    "P@100": metrics[7],
+                    "R@100": metrics[8],
+                    "P@1000": metrics[9],
+                    "R@1000": metrics[10]
                 })
 
-                # We save a model depending on the P@{relevance_cutoff} value, call it best_model
+                # TODO: decide how to choose what cutoff to base saving a model on
+                # Probably should be the last metric (P@1000, R@1000)
                 r_cutoff = metrics[-1]
                 p_cutoff = metrics[-2]
 
@@ -252,23 +261,20 @@ def finetune(
     tokenizer.save_pretrained(f"{output_dir}/model_{step}_last")
 
     # Do some final evaluation on the validation set
-    auc, mrr = evaluate(model, tokenizer, eval_dataset, eval_batch_size=eval_batch_size)
-    mrr = sum(mrr) / len(mrr)
+    auc, mrr, auprc = evaluate(model, tokenizer, pt_dataset_do_train, eval_dataset, model_name_or_path)
     
-    # Plot this final evaluation
-    plt.title("AUC Curve over the validation dataset")
-    plt.ylabel("True Positives Rate")
-    plt.xlabel("False Positive Rate")
-    for datapoint in auc:
-        fpr, tpr, _ = datapoint
-        plt.plot(fpr, tpr, alpha=0.7)
-    wandb.log({'AUC Curve over validation': plt})
+    logger.info(f" Average AUC ROC score over the validation dataset: {auc}")
+    logger.info(f" Average MRR over the validation dataset: {mrr}")
+    logger.info(f" Average AUPRC over the validation dataset: {auprc}")
 
-    logger.info(f" Average MRR over validation dataset: {mrr}")
-        
+    wandb.log({
+        "auc": auc,
+        "mrr": mrr,
+        "auprc": auprc
+    })
+
 @torch.no_grad()
-def evaluate(model, tokenizer, eval_dataset, eval_batch_size=1):
-    breakpoint()
+def evaluate(model, tokenizer, pt_dataset, eval_dataset, model_name_or_path=None, eval_batch_size=16):
     eval_dataset = RetrievalDataset(eval_dataset)
     eval_sampler = SequentialSampler(eval_dataset)
 
@@ -278,37 +284,75 @@ def evaluate(model, tokenizer, eval_dataset, eval_batch_size=1):
         eval_dataset,
         sampler=eval_sampler,
         batch_size=eval_batch_size,
-        collate_fn=collator
+        collate_fn=collator,
     )
 
+    # Model eval before doing anything else
+    model.eval()
+
+    # First, preliminarily index all of the documents in the associated set
+    CACHE_DIR = Path(user_cache_dir("open-mds", "ai2")) / "indices"
+    index_path =  CACHE_DIR / pt_dataset.path
+    if pt_dataset.name is not None:
+        index_path = index_path / pt_dataset.name
+    index_path.mkdir(parents=True, exist_ok=True)
+
+    indexer = SentenceTransformersIndexer(
+        model_name_or_path=model_name_or_path,
+        index_path=str(index_path),
+        overwrite=False,
+        normalize=False,
+        verbose=False,
+    )
+    indexer.index(pt_dataset.get_corpus_iter(verbose=True))
+    
+    index_total = indexer.faiss_index.index.ntotal
+    retrieval_pipeline = SentenceTransformersRetriever(
+        model_name_or_path=model_name_or_path,
+        index_path=str(index_path),
+        num_results=index_total,
+        verbose=False,
+    )
+
+    topics = pt_dataset.get_topics('validation')
+    retrieved = retrieval_pipeline.transform(topics)
+
+    # Dataloader needs to return some kind of dataframe
+    # Need to map doc id to 1's and 0's per document
+
+    # Now that all of the documents have been indexed once, calculate the scores for each query, batched
     auc_scores = []
     mrr_scores = []
-    model.eval()
+    auprc_scores = []
     for batch in tqdm(eval_dataloader, desc=f"Evaluation", total=len(eval_dataloader)):
-        batch = {key: value.cuda() if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
+        # batch = {key: value.cuda() if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
+        # inputs = {key: value.cuda() if isinstance(value, torch.Tensor)}
+        # q_tokens = batch['q_tokens'].cuda()
+        # q_mask = batch['q_mask'].cuda()
+        qids = batch['qids']
+        gold_in = batch['gold']
+        neg_in = batch['negatives']
 
-        q_tokens, q_mask, p_tokens, p_mask, n_tokens, n_mask = batch.values()
-
-        p_size = len(p_tokens)
-        assert p_size == len(n_tokens)
-
-        q_out = model(q_tokens, q_mask)
-        p_out = model(p_tokens, p_mask)
-        n_out = model(n_tokens, n_mask)
-
-        q_embed = mean_pooling(q_out[0], q_mask)
-        pn_embed = torch.cat((mean_pooling(p_out[0], p_mask), mean_pooling(n_out[0], n_mask)))
-        scores = torch.einsum("id, jd->ij", q_embed, pn_embed)
+        # breakpoint()
+        # Index into the faiss index of the retriever
+        retrieved_scores = retrieved[retrieved.qid.isin(qids)].sort_values(
+            by=["qid", "score", "docno"],
+            ascending=[True, False, True]
+        )
 
         # Calculate ROC auc averages
-        auc = calculate_auc(scores)
+        auc = calculate_auc(retrieved_scores, qids, gold_in, neg_in)
         auc_scores.append(auc)
 
         # Calculate MRR
-        mrr = calculate_mrr(scores)
+        mrr = calculate_mrr(retrieved_scores, qids, gold_in, neg_in)
         mrr_scores.append(mrr)
 
-    return auc_scores, mrr_scores
+        # Calculate AUPRC
+        auprc = calculate_auprc(retrieved_scores, qids, gold_in, neg_in)
+        auprc_scores.append(auprc)
+
+    return sum(auc_scores) / len(eval_dataloader), sum(mrr_scores) / len(eval_dataloader), sum(auprc_scores) / len(eval_dataloader)
 
 @torch.no_grad()
 def pt_evaluation(model_name_or_path, pt_dataset, output_dir, relevance_cutoff=100, split='validation'):
@@ -335,8 +379,6 @@ def pt_evaluation(model_name_or_path, pt_dataset, output_dir, relevance_cutoff=1
         index_path = index_path / pt_dataset.name
     index_path.mkdir(parents=True, exist_ok=True)
 
-    import pyterrier as pt
-    from pyterrier_sentence_transformers import SentenceTransformersIndexer, SentenceTransformersRetriever
     indexer = SentenceTransformersIndexer(
         model_name_or_path=model_name_or_path,
         index_path=str(index_path),
@@ -345,19 +387,25 @@ def pt_evaluation(model_name_or_path, pt_dataset, output_dir, relevance_cutoff=1
         verbose=False,
     )
     indexer.index(pt_dataset.get_corpus_iter(verbose=True))
+
+    index_total = indexer.faiss_index.index.ntotal
     retrieval_pipeline = SentenceTransformersRetriever(
         model_name_or_path=model_name_or_path,
         index_path=str(index_path),
-        num_results=relevance_cutoff,
+        num_results=index_total,
         verbose=False,
     )
     topics = pt_dataset.get_topics(split)
     qrels = pt_dataset.get_qrels(split)
     retrieved = retrieval_pipeline.transform(topics)
-    
-    # Metrics: P@1, P@5, P@{relevance_cutoff}, recall@1, recall@5, recall@{relevance_cutoff}
-    eval_metrics = ["P_1", "recall_1", "P_5", "recall_5"]
-    eval_metrics += [f"P_{relevance_cutoff}", f"recall_{relevance_cutoff}"]
+
+    eval_metrics = [
+        "P_1", "recall_1",
+        "P_5", "recall_5",
+        "P_20", "recall_20",
+        "P_100", "recall_100",
+        "P_1000", "recall_1000"
+    ]
 
     print(f"[bold]:test_tube: Evaluating retrieved results on the {split} set [/bold]")
 
@@ -455,6 +503,7 @@ def main():
         finetune(
             model,
             tokenizer,
+            retriever_args.model_name_or_path,
             training_args.output_dir,
             pt_dataset,
             retriever_args.n_random_negatives,
@@ -467,14 +516,15 @@ def main():
             relevance_cutoff=retriever_args.relevance_cutoff
         )
 
-    # Here, we take the test set and then do the predictions on the eval
+    # Here, we take the validation set and then do the predictions on the eval
     # For do_eval, we include the ROC Curve and final MRR calculations
+    # TODO: we've removed the test set. Using only validation here.
     if training_args.do_eval:
-        logger.info(f" Starting evaluation!")
+        logger.info(f" Starting evaluation on validation set!")
 
         pt_dataset_do_eval = copy.deepcopy(pt_dataset)
         del pt_dataset_do_eval._hf_dataset['train']
-        del pt_dataset_do_eval._hf_dataset['validation']
+        del pt_dataset_do_eval._hf_dataset['test']
 
         print(
             pt_evaluation(
@@ -482,30 +532,34 @@ def main():
                 pt_dataset_do_eval,
                 training_args.output_dir,
                 retriever_args.relevance_cutoff,
-                split="test"
+                split="validation"
             )
         )
 
         dataset_dict = transform_data(
             pt_dataset,
             n_random_negatives=retriever_args.n_random_negatives,
-            splits=['test']
+            splits=['validation']
         )
-        eval_dataset = dataset_dict['test']
+        eval_dataset = dataset_dict['validation']
 
-        auc, mrr = evaluate(model, tokenizer, eval_dataset)
-        mrr = sum(mrr) / len(mrr)
-    
-        # Plot this final evaluation
-        plt.title("AUC Curve over the test dataset")
-        plt.ylabel("True Positives Rate")
-        plt.xlabel("False Positive Rate")
-        for datapoint in auc:
-            fpr, tpr, _ = datapoint
-            plt.plot(fpr, tpr, alpha=0.7)
-        wandb.log({'AUC Curve over test': plt})
+        auc, mrr, auprc = evaluate(
+            model,tokenizer,
+            pt_dataset_do_eval,
+            eval_dataset,
+            retriever_args.model_name_or_path,
+            eval_batch_size=training_args.per_device_eval_batch_size
+        )
 
-        logger.info(f" Average MRR over the test dataset: {mrr}")
+        logger.info(f" Average AUC ROC score over the validation dataset: {auc}")
+        logger.info(f" Average MRR over the validation dataset: {mrr}")
+        logger.info(f" Average AUPRC over the validation dataset: {auprc}")
+
+        wandb.log({
+            "auc": auc,
+            "mrr": mrr,
+            "auprc": auprc
+        })
 
 if __name__ == "__main__":
     main()
