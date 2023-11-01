@@ -5,8 +5,6 @@
     "model_name_or_path": "allenai/led-base-16384-ms2",
     "output_dir": "/scratch/li.mil/open-domain-mds-merge/tuned_baseline",
     "seed": 42,
-    "alpha_test": true,
     "alpha_range": [0.1, 0.8],
-    "alpha_step": 0.1,
-    "alpha": null
+    "alpha_step": 0.1
 }
