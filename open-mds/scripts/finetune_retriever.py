@@ -543,8 +543,10 @@ def main():
         )
         eval_dataset = dataset_dict['validation']
 
+        # TODO: add the scoring metrics here over the _best_ model that we get
         auc, mrr, auprc = evaluate(
-            model,tokenizer,
+            model,
+            tokenizer,
             pt_dataset_do_eval,
             eval_dataset,
             retriever_args.model_name_or_path,

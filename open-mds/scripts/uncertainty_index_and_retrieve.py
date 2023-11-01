@@ -12,12 +12,11 @@ Q: index the files first or determine them based on relevance?
 Example command:
 python ./scripts/uncertainty_index_and_retrieve.py "ms2" "./output/datasets/ms2_full" 2
 
-
 How do we run this?
 python ./scripts/uncertainty_index_and_retrieve.py \
-        "ms2" "./output/datasets/tiny_ms2_retrieved_split=1" \
+        "ms2" "./output/datasets/ms2_retrieved_split=1" \
         1 \
-        --model-name-or-path "/scratch/li.mil/open-domain-mds-merge/contriever_ms2/model_best" 
+        --model-name-or-path "/scratch/li.mil/open-domain-mds-merge/contriever_msmarco_ms2/model_best" 
 """
 
 # 1. Convert all documents into the embeds and store in faiss dataframe
