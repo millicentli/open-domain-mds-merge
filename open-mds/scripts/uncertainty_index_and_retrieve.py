@@ -16,12 +16,21 @@ How do we run this?
 python ./scripts/uncertainty_index_and_retrieve.py \
         "ms2" "./output/datasets/ms2_retrieved_split=1" \
         1 \
-        --model-name-or-path "/scratch/li.mil/open-domain-mds-merge/contriever_msmarco_ms2/model_best" 
-"""
+        --relevance-cutoff 1000 \
+        --model-name-or-path "/scratch/li.mil/open-domain-mds-merge/contriever_msmarco_ms2/model_best" \
+        --classifier-file "/scratch/li.mil/open-domain-mds-merge/platt_calibration/ms2/logreg_1000.pkl"
 
-# 1. Convert all documents into the embeds and store in faiss dataframe
-# 2. For each query, build an index of documents associated with the query
-# 3. For each query, save that information
+python ./scripts/uncertainty_index_and_retrieve.py \
+        "cochrane" "./output/datasets/cochrane_retrieved_split=1" \
+        1 \
+        --relevance-cutoff 500 \
+        --model-name-or-path "/scratch/li.mil/open-domain-mds-merge/contriever_cochrane/model_best" \
+        --classifier-file "/scratch/li.mil/open-domain-mds-merge/platt_calibration/cochrane/logreg_500.pkl"
+
+The average number of documents that fit into a context window for:
+- MS2 = 40
+- Cochrane = 45
+"""
 
 import copy
 from enum import Enum
@@ -30,12 +39,13 @@ from typing import List
 
 from functools import partial
 from rich import print
-from sklearn.linear_model import LogisticRegression as lr
+from sklearn.linear_model import SGDClassifier
 from transformers import AutoModel, AutoTokenizer
 
 import more_itertools
 import numpy as np
 import pandas as pd
+import pickle
 import random
 import torch
 import typer
@@ -53,6 +63,12 @@ _DEFAULT_NEURAL_RETRIEVER = "facebook/contriever-msmarco"
 
 # Default batch size to use
 _BATCH_SIZE = 32
+
+# Number of docs that fit in the context window
+docs_per_window = {
+    "ms2": 45,
+    "cochrane": 40
+}
 
 class Dataset(str, Enum):
     multinews = "multinews"
@@ -76,18 +92,24 @@ def construct_data(review_ids, pmids, retrieved):
     new_labels = []
     # Construct the data
     for idx, (review, pmid) in enumerate(zip(review_ids, pmids)):
+        curr_pmids = []
         # Review ID is key
         docs = retrieved[retrieved.qid == review]
-        not_docs = retrieved[retrieved.qid != review]
         
         # Match to pmid
         for doc in list(docs.docno):
             if doc in pmid:
                 new_pmids.append(doc)
+                curr_pmids.append(doc)
                 new_scores.append(docs[docs.docno == doc]['score'].item())
                 new_labels.append(1)
 
-        neg_sampled = not_docs.sample(n=len(docs.docno), random_state=42)
+        not_docs = docs[~docs.docno.isin(curr_pmids)]
+
+        if len(curr_pmids) > len(not_docs):
+            neg_sampled = not_docs.sample(n=len(not_docs), random_state=42)
+        else:
+            neg_sampled = not_docs.sample(n=len(curr_pmids), random_state=42)
 
         for docno, score in zip(neg_sampled.docno, neg_sampled.score):
             new_pmids.append(docno)
@@ -108,9 +130,10 @@ def train_logreg(hf_dataset, retrieved, split='train'):
     Takes in the original huggingface dataset and the retrieved dataset;
     fashions the data for training the logreg
     """
+
     review_ids = hf_dataset[split]['review_id']
     pmids = hf_dataset[split]['pmid']
-
+    
     assert(len(review_ids) == len(pmids))
 
     df = construct_data(review_ids, pmids, retrieved)
@@ -122,7 +145,11 @@ def train_logreg(hf_dataset, retrieved, split='train'):
     X = df[features]
     y = df.label
 
-    logreg = lr(random_state=42)
+    logreg = SGDClassifier(
+        loss="log_loss",
+        penalty=None,
+        shuffle=True
+    )
     logreg.fit(X, y)
 
     return logreg
@@ -159,18 +186,22 @@ def main(
         1, # should be ~10 but I'll do 2 for now
         help="Number of subsets per query that we keep"
     ),
-    relevance_cutoff: int = typer.Argument(
-        100,
+    relevance_cutoff: int = typer.Option(
+        1000,
         help="Number of documents to cut off for relevance; num_results_per_query basically, so "
              "the number of results to retrieve per query. "
              " Only really change if you want to be able to retrieve from a larger swath of documents."
     ),
-    # num_docs: int = typer.Argument(
-    #     10,
-    #     help="Number of docs we want per subsets"
-    # ),
     splits: List[str] = typer.Option(
         None, help="Which splits of the dataset to replace with retrieved documents. Defaults to all splits."
+    ),
+    classifier_file: str = typer.Option(
+        None,
+        help=(
+            "Directory in which our logistic regression is saved that we'll use to calibrate our retriever outputs."
+            "Load the classifier that's trained on the same relevance cutoff as chosen in this file."
+            "There are no error checks for this, so be consistent."
+        )
     ),
     projection_size: int = typer.Argument(
         768,
@@ -223,6 +254,7 @@ def main(
     if pt_dataset.name is not None:
         index_path = index_path / pt_dataset.name
     index_path.mkdir(parents=True, exist_ok=True)
+    
     # Use all splits if not specified
     splits = splits or list(pt_dataset._hf_dataset.keys())
     print(f"[bold blue]:information: Will replace documents in {', '.join(splits)} splits")
@@ -253,8 +285,7 @@ def main(
 
     print(f"[bold green]:white_check_mark: Loaded the index from '{index_path}' [/bold green]")
 
-    # TODO: need to link query w/ review id
-    # What's the eval?
+    logreg = None
     for split in splits:
         print(
             f"[bold]:magnifying_glass_tilted_right: Retrieving docs for each example in the '{split}' set... [/bold]"
@@ -265,7 +296,18 @@ def main(
         # Retrieve and train the model
         # We train on train and then extract probs for the other splits
         if split == "train":
-            logreg = train_logreg(hf_dataset, retrieved)
+            # Train our own here
+            if classifier_file is None:
+                print(
+                    "[bold]:magnifying_glass_tilted_right: Training a new classifier! [/bold]"
+                )
+                logreg = train_logreg(hf_dataset, retrieved)
+            # Load a classifier (must be the same relevance cutoff as the one specified in this file)
+            else:
+                print(
+                    f"[bold]:magnifying_glass_tilted_right: Loading an existing classifier at {classifier_file}. [/bold]"
+                )
+                logreg = pickle.load(open(classifier_file, "rb"))
 
         X = pd.DataFrame(retrieved["score"], columns=["score"])
         calibrated = logreg.predict_proba(X)
@@ -286,20 +328,21 @@ def main(
         for qid in qid_list:
             selected_docnos = []
             for subset in range(subsets):
-                # related = retrieved[retrieved.qid == qid]
-                # We want to take a percentage here and sample from most relevant; let's make
-                # a cutoff
-                # Calculate the percentage
-                # num_docs = int((relevance_cutoff / 100) * len(related))
-                # related = related.head(num_docs)
-                # related = related.sample(frac=1, random_state=42)
                 related = retrieved[retrieved.qid == qid].sample(frac=1, random_state=42)
                 related['selected'] = related.apply(sample_bern, axis=1)
                 selected = related[related.selected == 1]
-                selected_docnos.append(list(selected.docno))
+
+                # Order by rank 
+                # TODO: maybe order the docs by relevance as opposed to the order they're sampled
+                ordered = selected.sort_values(by=['rank'])
+                rank_list = ordered[:docs_per_window[hf_dataset_name.value]]['rank'].tolist()
+                final_selected = selected[selected['rank'].isin(rank_list)]
+
+                # Select our documents
+                selected_docnos.append(list(final_selected.docno))
+
             qid_to_docnos[qid] = selected_docnos            
         
-        print("After creating dataframe!")
         # Now I have the set of documents; assemble a new dataset that copies the prev
         hf_dataset[split] = hf_dataset[split].map(
             partial(pt_dataset.replace, split=split, qid_to_docnos=qid_to_docnos),
