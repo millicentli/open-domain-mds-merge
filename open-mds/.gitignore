@@ -167,3 +167,4 @@ csv/
 contriever/
 temp/
 logs/
+*png
