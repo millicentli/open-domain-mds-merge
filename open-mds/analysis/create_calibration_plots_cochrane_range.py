@@ -9,7 +9,6 @@ import pickle
 import random
 
 from pathlib import Path
-from sklearn.linear_model import LogisticRegression as lr
 from sklearn.linear_model import SGDClassifier
 
 from open_mds import indexing_basic
