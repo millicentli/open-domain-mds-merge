@@ -43,16 +43,10 @@ def construct_data(review_ids, pmids, retrieved):
                 new_labels.append(1)
 
         not_docs = docs[~docs.docno.isin(curr_pmids)]
-
-        if len(curr_pmids) > len(not_docs):
-            neg_sampled = not_docs.sample(n=len(not_docs), random_state=42)
-        else:
-            neg_sampled = not_docs.sample(n=len(curr_pmids), random_state=42)
-
-        for docno, score in zip(neg_sampled.docno, neg_sampled.score):
-            new_pmids.append(docno)
-            new_scores.append(score)
-            new_labels.append(0)
+        
+        new_pmids.extend(not_docs.docno.values)
+        new_scores.extend(not_docs.score.values)
+        new_labels.extend([0] * len(not_docs))
 
     # Now, fashion it for training by putting it into a df
     data_dict = {"review_id": new_pmids, "score": new_scores, "label": new_labels}
