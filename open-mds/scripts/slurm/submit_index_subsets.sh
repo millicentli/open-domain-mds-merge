@@ -1,9 +1,7 @@
 #!/bin/bash
 # To run: ./scripts/slurm/submit_index_subsets.sh "ms2" "/work/frink/li.mil/data/marginalization-datasets"
 
-# SUBSETS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)
-SUBSETS=(10 15 20)
-# SUBSETS=(1)
+SUBSETS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)
 DATASET=$1
 OUTPUT_DIR=$2
 
