@@ -119,7 +119,7 @@ class RetrieverFinetuningArguments:
         metadata={"help": "The relevance cutoff that we'll use."}
     )
     log_freq: int = field(
-        default=1000,
+        default=100,
         metadata={"help": "How often to log output during training."}
     )
 
@@ -185,8 +185,8 @@ def finetune(
     model.cuda()
 
     step = 0
-    max_recall = -1000
     max_precision = -1000
+    max_precision_5 = -1000
     for epoch in range(num_epochs):
         for batch in tqdm(train_dataloader, desc=f"Training, Epoch {epoch}"):
             batch = {key: value.cuda() if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
@@ -243,14 +243,14 @@ def finetune(
                     "R@1000": metrics[10]
                 })
 
-                # TODO: decide how to choose what cutoff to base saving a model on
-                # Probably should be the last metric (P@1000, R@1000)
-                r_cutoff = metrics[-1]
-                p_cutoff = metrics[-2]
+                p_cutoff = metrics[1]
+                p_5_cutoff = metrics[3]
 
-                if r_cutoff > max_recall and p_cutoff > max_precision:
-                    max_recall = r_cutoff
+                # The cutoff is based on multiple properties, e.g. if any
+                # of the metrics are greater.
+                if p_cutoff > max_precision or p_5_cutoff > max_precision_5:
                     max_precision = p_cutoff
+                    max_precision_5 = p_5_cutoff
 
                     # If it's the best model, save it as the best model
                     model.module.save_pretrained(f"{output_dir}/model_best", from_pt=True)
@@ -261,7 +261,7 @@ def finetune(
     tokenizer.save_pretrained(f"{output_dir}/model_{step}_last")
 
     # Do some final evaluation on the validation set
-    auc, mrr, auprc = evaluate(model, tokenizer, pt_dataset_do_train, eval_dataset, model_name_or_path)
+    auc, mrr, auprc = evaluate(tokenizer, pt_dataset_do_train, eval_dataset, model_name_or_path)
     
     logger.info(f" Average AUC ROC score over the validation dataset: {auc}")
     logger.info(f" Average MRR over the validation dataset: {mrr}")
@@ -274,7 +274,7 @@ def finetune(
     })
 
 @torch.no_grad()
-def evaluate(model, tokenizer, pt_dataset, eval_dataset, model_name_or_path=None, eval_batch_size=16):
+def evaluate(tokenizer, pt_dataset, eval_dataset, model_name_or_path=None, eval_batch_size=16):
     eval_dataset = RetrievalDataset(eval_dataset)
     eval_sampler = SequentialSampler(eval_dataset)
 
@@ -288,7 +288,7 @@ def evaluate(model, tokenizer, pt_dataset, eval_dataset, model_name_or_path=None
     )
 
     # Model eval before doing anything else
-    model.eval()
+    # model.eval()
 
     # First, preliminarily index all of the documents in the associated set
     CACHE_DIR = Path(user_cache_dir("open-mds", "ai2")) / "indices"
@@ -333,7 +333,6 @@ def evaluate(model, tokenizer, pt_dataset, eval_dataset, model_name_or_path=None
         gold_in = batch['gold']
         neg_in = batch['negatives']
 
-        # breakpoint()
         # Index into the faiss index of the retriever
         retrieved_scores = retrieved[retrieved.qid.isin(qids)].sort_values(
             by=["qid", "score", "docno"],
@@ -413,8 +412,16 @@ def pt_evaluation(model_name_or_path, pt_dataset, output_dir, relevance_cutoff=1
         name = "Contriever"
     elif model_name_or_path == "facebook/contriever-msmarco":
         name = "Contriever-MSMARCO"
-    else:
+    elif "ms2" in model_name_or_path and "msmarco" in model_name_or_path:
+        name = "Contriever-MSMARCO-MS2"
+    elif "cochrane" in model_name_or_path and "msmarco" in model_name_or_path:
+        name = "Contriever-MSMARCO-Cochrane"
+    elif "ms2" in model_name_or_path:
         name = "Contriever-MS2"
+    elif "cochrane" in model_name_or_path:
+        name = "Contriever-Cochrane"
+    else:
+        raise ValueError("Pick a valid model!")
 
     outputs = pt.Experiment(
         [retrieved],
@@ -474,10 +481,10 @@ def main():
     set_seed(training_args.seed)
 
     # Loading dataset, model, tokenizer individually per process
-    if retriever_args.hf_dataset_name == Dataset.ms2:
-        pt_dataset = indexing_basic.MSLR2022Dataset(name=retriever_args.hf_dataset_name)
-    else:
-        raise NotImplementedError
+    # if retriever_args.hf_dataset_name == Dataset.ms2:
+        # pt_dataset = indexing_basic.MSLR2022Dataset(name=retriever_args.hf_dataset_name)
+    # else:
+    pt_dataset = indexing_basic.MSLR2022Dataset(name=retriever_args.hf_dataset_name)
 
     print(
         f"[bold]:book: Dataset chosen: '{retriever_args.hf_dataset_name}'... [/bold]"
@@ -544,8 +551,8 @@ def main():
         eval_dataset = dataset_dict['validation']
 
         # TODO: add the scoring metrics here over the _best_ model that we get
+        # TODO: need to fix this, it's not using our "best" model.
         auc, mrr, auprc = evaluate(
-            model,
             tokenizer,
             pt_dataset_do_eval,
             eval_dataset,
